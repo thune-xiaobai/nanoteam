@@ -415,15 +415,53 @@ class Orchestrator:
                 _log(f"  - {d[:100]}")
 
         print(file=sys.stderr)
-        _log("Press Enter to continue, or type feedback/new requirements:")
+        _log("Commands: Enter=continue, ?=show plan details, feedback text=send to Lead")
 
         try:
             feedback = input("> ").strip()
         except (EOFError, KeyboardInterrupt):
             feedback = ""
 
-        if feedback:
-            self._apply_feedback(graph, feedback)
+        if not feedback:
+            return
+
+        if feedback == "?":
+            self._show_plan_details(graph)
+            # Re-prompt after showing details
+            self._checkpoint(graph, phase)
+            return
+
+        self._apply_feedback(graph, feedback)
+
+    def _show_plan_details(self, graph: TaskGraph) -> None:
+        """Show detailed plan info without invoking any agents."""
+        print(file=sys.stderr)
+        _log("─── Task Graph ───")
+        for task in graph.tasks.values():
+            deps = f" ← {', '.join(task.depends_on)}" if task.depends_on else ""
+            files = f" [files: {', '.join(task.changed_files)}]" if task.changed_files else ""
+            _log(f"  {task.id}: {task.title}")
+            _log(f"    status={task.status.value} role={task.role} model={task.assigned_model} attempt={task.attempt}{deps}{files}")
+            spec = self.ws.read_task_spec(task.id) if (self.ws.base / "tasks" / task.id / "spec.md").exists() else None
+            if spec:
+                # Show first 3 lines of spec
+                spec_preview = "\n".join(spec.strip().split("\n")[:3])
+                _log(f"    spec: {spec_preview}")
+
+        if graph.roles:
+            print(file=sys.stderr)
+            _log("─── Roles ───")
+            for role in graph.roles.values():
+                _log(f"  {role.name}: {role.description[:100]}")
+
+        if graph.decisions:
+            print(file=sys.stderr)
+            _log("─── Decisions ───")
+            for d in graph.decisions:
+                _log(f"  - {d[:120]}")
+
+        _log(f"\nConfig: lead={self.config.lead_model} worker={self.config.worker_model} budget=${self.config.max_budget:.0f}")
+        print(file=sys.stderr)
 
     def _apply_feedback(self, graph: TaskGraph, feedback: str) -> None:
         """Send client feedback to Lead and apply the resulting plan changes."""
