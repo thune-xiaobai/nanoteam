@@ -1,0 +1,286 @@
+from __future__ import annotations
+
+import json
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+from .claude import ClaudeResult, invoke_claude
+from .models import Role, Task, TaskGraph, TaskStatus
+from .prompts import (
+    lead_planning_prompt,
+    lead_replan_prompt,
+    lead_review_prompt,
+    worker_prompt,
+)
+from .workspace import Workspace
+
+
+@dataclass
+class Config:
+    lead_model: str = "opus"
+    worker_model: str = "sonnet"
+    max_budget: float = 10.0
+    lead_budget: float = 2.0
+    worker_budget: float = 1.0
+    review_budget: float = 0.5
+
+
+class Orchestrator:
+    def __init__(self, workspace: Workspace, config: Config):
+        self.ws = workspace
+        self.config = config
+        self.total_cost = 0.0
+
+    def run(self) -> None:
+        graph = self.ws.load_task_graph()
+
+        if not graph.tasks:
+            graph = self._plan(graph)
+            self.ws.save_task_graph(graph)
+
+        while not graph.is_complete():
+            self._check_budget()
+
+            ready = graph.ready_tasks()
+            if not ready:
+                in_progress = [t for t in graph.tasks.values() if t.status == TaskStatus.IN_PROGRESS]
+                if in_progress:
+                    _log("Tasks still in progress, but none ready. Possible stall.")
+                else:
+                    _log("No tasks ready and none in progress. Deadlock detected.")
+                break
+
+            for task in ready:
+                self._execute_task(graph, task)
+                self.ws.save_task_graph(graph)
+
+        if graph.is_complete():
+            self._finalize(graph)
+        else:
+            _log(f"Stopped. {sum(1 for t in graph.tasks.values() if t.status == TaskStatus.DONE)}/{len(graph.tasks)} tasks done.")
+            _log(f"Total cost: ${self.total_cost:.2f}")
+
+    def _plan(self, graph: TaskGraph) -> TaskGraph:
+        _log("Planning: asking Lead to decompose the goal...")
+
+        sys_prompt, user_prompt = lead_planning_prompt(graph.goal)
+        result = invoke_claude(
+            user_prompt,
+            system_prompt=sys_prompt,
+            model=self.config.lead_model,
+            max_budget_usd=self.config.lead_budget,
+            cwd=str(self.ws.root),
+        )
+        self.total_cost += result.cost_usd
+
+        if not result.success:
+            _log(f"Lead planning failed: {result.error}")
+            raise RuntimeError(f"Planning failed: {result.error}")
+
+        plan = self._parse_json(result.output)
+
+        for tdata in plan.get("tasks", []):
+            task = Task(
+                id=tdata["id"],
+                title=tdata["title"],
+                depends_on=tdata.get("depends_on", []),
+                role=tdata.get("role"),
+                assigned_model=self.config.worker_model,
+            )
+            graph.tasks[task.id] = task
+            self.ws.write_task_spec(task.id, tdata.get("spec", task.title))
+            if tdata.get("context"):
+                ctx = tdata["context"]
+                if isinstance(ctx, list):
+                    ctx = "\n".join(str(c) for c in ctx)
+                self.ws.write_task_context(task.id, str(ctx))
+
+        for rdata in plan.get("roles", []):
+            role = Role(
+                name=rdata["name"],
+                description=rdata["description"],
+                allowed_tools=rdata.get("allowed_tools", ["Read", "Grep", "Glob", "Edit", "Write", "Bash"]),
+                allowed_dirs=rdata.get("allowed_dirs", []),
+            )
+            graph.roles[role.name] = role
+            self.ws.write_role(role)
+
+        graph.decisions.extend(plan.get("decisions", []))
+        for d in plan.get("decisions", []):
+            self.ws.append_decision(d)
+
+        _log(f"Plan created: {len(graph.tasks)} tasks, {len(graph.roles)} roles")
+        return graph
+
+    def _execute_task(self, graph: TaskGraph, task: Task) -> None:
+        _log(f"Executing {task.id}: {task.title} (role={task.role}, model={task.assigned_model})")
+
+        task.status = TaskStatus.IN_PROGRESS
+        self.ws.save_task_graph(graph)
+
+        # Snapshot files before worker runs
+        before = self.ws.snapshot_files()
+
+        role = graph.roles.get(task.role) if task.role else None
+        spec = self.ws.read_task_spec(task.id)
+        context = self.ws.build_dynamic_context(task, graph)
+        role_def = role.description if role else "General-purpose software engineer."
+
+        sys_prompt, user_prompt = worker_prompt(spec, context, role_def)
+
+        worker_result = invoke_claude(
+            user_prompt,
+            system_prompt=sys_prompt,
+            model=task.assigned_model,
+            allowed_tools=role.allowed_tools if role else None,
+            add_dirs=self._resolve_dirs(role) if role else None,
+            max_budget_usd=self.config.worker_budget,
+            cwd=str(self.ws.root),
+        )
+        self.total_cost += worker_result.cost_usd
+
+        # Snapshot after and record changed files
+        after = self.ws.snapshot_files()
+        task.changed_files = self.ws.diff_files(before, after)
+        if task.changed_files:
+            _log(f"  Files changed: {', '.join(task.changed_files)}")
+
+        if not worker_result.success:
+            _log(f"Worker failed on {task.id}: {worker_result.error}")
+            self.ws.write_task_result(task.id, f"FAILED: {worker_result.error}")
+        else:
+            self.ws.write_task_result(task.id, worker_result.output)
+
+        task.status = TaskStatus.REVIEW
+        verdict = self._review(graph, task)
+
+        if verdict.get("verdict") == "accept":
+            task.status = TaskStatus.DONE
+            _log(f"Task {task.id} accepted: {verdict.get('reason', '')[:80]}")
+            if verdict.get("decision"):
+                graph.decisions.append(verdict["decision"])
+                self.ws.append_decision(verdict["decision"])
+        else:
+            task.status = TaskStatus.FAILED
+            task.attempt += 1
+            _log(f"Task {task.id} rejected (attempt {task.attempt}/{task.max_attempts}): {verdict.get('reason', '')[:80]}")
+            if task.attempt < task.max_attempts:
+                self._replan_task(graph, task, verdict.get("reason", "Unknown"))
+            else:
+                _log(f"Task {task.id} exceeded max attempts. Marking as failed.")
+
+    def _review(self, graph: TaskGraph, task: Task) -> dict:
+        _log(f"Reviewing {task.id}...")
+
+        spec = self.ws.read_task_spec(task.id)
+        result = self.ws.read_task_result(task.id) or "No result."
+
+        sys_prompt, user_prompt = lead_review_prompt(
+            graph.goal, task, spec, result, graph.decisions,
+        )
+        review = invoke_claude(
+            user_prompt,
+            system_prompt=sys_prompt,
+            model=self.config.lead_model,
+            max_budget_usd=self.config.review_budget,
+            cwd=str(self.ws.root),
+        )
+        self.total_cost += review.cost_usd
+
+        if not review.success:
+            _log(f"Review failed, auto-accepting: {review.error}")
+            return {"verdict": "accept", "reason": "Review invocation failed, auto-accepting."}
+
+        return self._parse_json(review.output)
+
+    def _replan_task(self, graph: TaskGraph, task: Task, reason: str) -> None:
+        _log(f"Replanning {task.id}...")
+
+        sys_prompt, user_prompt = lead_replan_prompt(graph.goal, graph, task, reason)
+        result = invoke_claude(
+            user_prompt,
+            system_prompt=sys_prompt,
+            model=self.config.lead_model,
+            max_budget_usd=self.config.review_budget,
+            cwd=str(self.ws.root),
+        )
+        self.total_cost += result.cost_usd
+
+        if not result.success:
+            _log(f"Replan failed: {result.error}. Retrying with same spec.")
+            task.status = TaskStatus.READY
+            return
+
+        plan = self._parse_json(result.output)
+        action = plan.get("action", "retry")
+
+        if action == "retry" and plan.get("updated_spec"):
+            self.ws.write_task_spec(task.id, plan["updated_spec"])
+            task.status = TaskStatus.READY
+        elif action == "split":
+            for tdata in plan.get("new_tasks", []):
+                new_task = Task(
+                    id=tdata["id"],
+                    title=tdata["title"],
+                    depends_on=tdata.get("depends_on", []),
+                    role=tdata.get("role", task.role),
+                    assigned_model=self.config.worker_model,
+                )
+                graph.tasks[new_task.id] = new_task
+                self.ws.write_task_spec(new_task.id, tdata.get("spec", new_task.title))
+                if tdata.get("context"):
+                    ctx = tdata["context"]
+                    if isinstance(ctx, list):
+                        ctx = "\n".join(str(c) for c in ctx)
+                    self.ws.write_task_context(new_task.id, str(ctx))
+            task.status = TaskStatus.DONE
+            _log(f"Task {task.id} split into {len(plan.get('new_tasks', []))} sub-tasks")
+        elif action == "reassign" and plan.get("new_role"):
+            task.role = plan["new_role"]
+            task.status = TaskStatus.READY
+        else:
+            task.status = TaskStatus.READY
+
+        if plan.get("decision"):
+            graph.decisions.append(plan["decision"])
+            self.ws.append_decision(plan["decision"])
+
+    def _resolve_dirs(self, role: Role) -> list[str] | None:
+        if not role.allowed_dirs:
+            return None
+        return [str(self.ws.root / d) for d in role.allowed_dirs]
+
+    def _check_budget(self) -> None:
+        if self.total_cost >= self.config.max_budget:
+            raise RuntimeError(
+                f"Budget exhausted: ${self.total_cost:.2f} >= ${self.config.max_budget:.2f}"
+            )
+
+    def _parse_json(self, text: str) -> dict:
+        text = text.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            _log(f"JSON parse error: {e}. Raw text: {text[:200]}")
+            return {"verdict": "accept", "reason": "JSON parse failed, auto-accepting.", "action": "retry"}
+
+    def _finalize(self, graph: TaskGraph) -> None:
+        _log("=" * 50)
+        _log("All tasks completed!")
+        _log(f"Total tasks: {len(graph.tasks)}")
+        _log(f"Total cost: ${self.total_cost:.2f}")
+        _log(f"Decisions made: {len(graph.decisions)}")
+        for d in graph.decisions:
+            _log(f"  - {d}")
+        _log("=" * 50)
+
+
+def _log(msg: str) -> None:
+    print(f"[nanoteam] {msg}", file=sys.stderr)
