@@ -151,12 +151,22 @@ def invoke_claude(
         cost = result_data.get("total_cost_usd", 0) or 0
         num_turns = result_data.get("num_turns", 0)
         _log(f"  done in {duration:.0f}s | cost=${cost:.4f} | turns={num_turns}")
+
+        # If error with empty result, try to get more info from stderr or the event itself
+        error_msg = None
+        if is_error:
+            error_msg = result_text
+            if not error_msg:
+                stderr = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
+                error_msg = stderr.strip() or f"Unknown error (is_error=true, cost=${cost:.4f}, turns={num_turns})"
+                _log(f"  error (empty result): {error_msg[:200]}")
+
         return ClaudeResult(
             success=not is_error,
             output=result_text,
             cost_usd=cost,
             duration_s=duration,
-            error=result_text if is_error else None,
+            error=error_msg,
         )
 
     # Fallback: no result event found

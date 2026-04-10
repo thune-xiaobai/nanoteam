@@ -24,9 +24,9 @@ class Config:
     lead_effort: str = "high"
     worker_effort: str = "medium"
     max_budget: float = 10.0
-    lead_budget: float = 2.0
-    worker_budget: float = 1.0
-    review_budget: float = 0.5
+    lead_budget: float | None = None
+    worker_budget: float | None = None
+    review_budget: float | None = None
     timeout: int = 3600
     stall_timeout: int = 300
     checkpoints: set[str] = None  # type: ignore[assignment]
@@ -34,6 +34,13 @@ class Config:
     def __post_init__(self) -> None:
         if self.checkpoints is None:
             self.checkpoints = {"plan", "finish"}
+        # Default per-invocation budgets: fraction of total, no artificial ceiling
+        if self.lead_budget is None:
+            self.lead_budget = self.max_budget * 0.2
+        if self.worker_budget is None:
+            self.worker_budget = self.max_budget * 0.1
+        if self.review_budget is None:
+            self.review_budget = self.max_budget * 0.05
 
 
 class Orchestrator:
