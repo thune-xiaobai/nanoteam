@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import select
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 
-DEFAULT_TIMEOUT = 600  # 10 minutes
+DEFAULT_TIMEOUT = 3600  # 60 minutes wall clock
+DEFAULT_STALL_TIMEOUT = 300  # 5 minutes without output = stalled
 
 
 @dataclass
@@ -29,6 +31,7 @@ def invoke_claude(
     max_budget_usd: float | None = None,
     cwd: str | None = None,
     timeout: int = DEFAULT_TIMEOUT,
+    stall_timeout: int = DEFAULT_STALL_TIMEOUT,
 ) -> ClaudeResult:
     cmd = [
         "claude",
@@ -63,45 +66,75 @@ def invoke_claude(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
+        text=False,  # raw bytes for non-blocking reads
         cwd=cwd,
     )
 
     result_data: dict | None = None
     last_activity = time.monotonic()
+    buf = b""
 
     try:
         assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
+        fd = proc.stdout.fileno()
 
-            last_activity = time.monotonic()
+        while True:
+            # Use select to wait for data with a short poll interval
+            ready, _, _ = select.select([fd], [], [], 5.0)
 
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+            now = time.monotonic()
+            elapsed = now - start
+            idle = now - last_activity
 
-            etype = event.get("type", "")
-
-            if etype == "assistant":
-                _process_assistant_event(event)
-            elif etype == "result":
-                result_data = event
-
-            # Check timeout
-            elapsed = time.monotonic() - start
             if elapsed >= timeout:
                 proc.kill()
                 proc.wait()
-                _log(f"  TIMEOUT after {elapsed:.0f}s")
+                _log(f"  TIMEOUT after {elapsed:.0f}s (wall clock)")
                 return ClaudeResult(
                     success=False, output="", cost_usd=0,
                     duration_s=elapsed,
                     error=f"Timeout after {elapsed:.0f}s",
                 )
+
+            if idle >= stall_timeout:
+                proc.kill()
+                proc.wait()
+                _log(f"  STALLED: no output for {idle:.0f}s (elapsed {elapsed:.0f}s)")
+                return ClaudeResult(
+                    success=False, output="", cost_usd=0,
+                    duration_s=elapsed,
+                    error=f"Stalled: no output for {idle:.0f}s",
+                )
+
+            if not ready:
+                continue
+
+            chunk = proc.stdout.read1(8192) if hasattr(proc.stdout, 'read1') else proc.stdout.read(8192)
+            if not chunk:
+                # EOF — process finished writing
+                break
+
+            last_activity = time.monotonic()
+            buf += chunk
+
+            # Process complete lines
+            while b"\n" in buf:
+                line_bytes, buf = buf.split(b"\n", 1)
+                line = line_bytes.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                etype = event.get("type", "")
+
+                if etype == "assistant":
+                    _process_assistant_event(event)
+                elif etype == "result":
+                    result_data = event
 
         proc.wait()
 
@@ -127,7 +160,7 @@ def invoke_claude(
         )
 
     # Fallback: no result event found
-    stderr = proc.stderr.read() if proc.stderr else ""
+    stderr = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
     _log(f"  finished in {duration:.0f}s but no result event (exit={proc.returncode})")
     return ClaudeResult(
         success=False, output="", cost_usd=0,

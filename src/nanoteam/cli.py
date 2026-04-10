@@ -24,6 +24,8 @@ def main() -> None:
     parser.add_argument("--lead-effort", default="high", choices=["low", "medium", "high", "max"], help="Effort level for Lead")
     parser.add_argument("--worker-effort", default="medium", choices=["low", "medium", "high", "max"], help="Effort level for workers")
     parser.add_argument("--max-budget", type=float, default=10.0, help="Total budget in USD")
+    parser.add_argument("--timeout", type=int, default=3600, help="Per-invocation wall-clock timeout in seconds (default: 3600)")
+    parser.add_argument("--stall-timeout", type=int, default=300, help="Kill if no output for this many seconds (default: 300)")
     parser.add_argument(
         "--checkpoint", default="plan,finish",
         help="Checkpoint timing: comma-separated list of plan,phase,finish,none (default: plan,finish)",
@@ -88,6 +90,8 @@ def main() -> None:
         lead_effort=args.lead_effort,
         worker_effort=args.worker_effort,
         max_budget=args.max_budget,
+        timeout=args.timeout,
+        stall_timeout=args.stall_timeout,
         checkpoints=checkpoints,
     )
 

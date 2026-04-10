@@ -27,6 +27,8 @@ class Config:
     lead_budget: float = 2.0
     worker_budget: float = 1.0
     review_budget: float = 0.5
+    timeout: int = 3600
+    stall_timeout: int = 300
     checkpoints: set[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -299,6 +301,8 @@ class Orchestrator:
         result = invoke_claude(
             user_prompt,
             system_prompt=sys_prompt,
+            timeout=kwargs.pop("timeout", self.config.timeout),
+            stall_timeout=kwargs.pop("stall_timeout", self.config.stall_timeout),
             **kwargs,
         )
         self.total_cost += result.cost_usd
