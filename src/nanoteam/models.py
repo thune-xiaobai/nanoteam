@@ -22,7 +22,7 @@ class Task:
     status: TaskStatus = TaskStatus.PENDING
     depends_on: list[str] = field(default_factory=list)
     role: str | None = None
-    assigned_model: str = "sonnet"
+    assigned_model: str = "claude-opus-4-6"
     attempt: int = 0
     max_attempts: int = 3
     changed_files: list[str] = field(default_factory=list)

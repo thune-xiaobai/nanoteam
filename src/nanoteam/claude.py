@@ -22,7 +22,8 @@ def invoke_claude(
     prompt: str,
     *,
     system_prompt: str | None = None,
-    model: str = "sonnet",
+    model: str = "claude-opus-4-6",
+    effort: str | None = None,
     allowed_tools: list[str] | None = None,
     add_dirs: list[str] | None = None,
     max_budget_usd: float | None = None,
@@ -41,6 +42,9 @@ def invoke_claude(
 
     if system_prompt:
         cmd.extend(["--system-prompt", system_prompt])
+
+    if effort:
+        cmd.extend(["--effort", effort])
 
     if allowed_tools:
         cmd.extend(["--allowedTools", " ".join(allowed_tools)])

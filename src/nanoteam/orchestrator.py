@@ -19,8 +19,10 @@ from .workspace import Workspace
 
 @dataclass
 class Config:
-    lead_model: str = "opus"
-    worker_model: str = "sonnet"
+    lead_model: str = "claude-opus-4-6"
+    worker_model: str = "claude-opus-4-6"
+    lead_effort: str = "high"
+    worker_effort: str = "medium"
     max_budget: float = 10.0
     lead_budget: float = 2.0
     worker_budget: float = 1.0
@@ -84,6 +86,7 @@ class Orchestrator:
         result = self._invoke_and_record(
             graph, None, "plan", sys_prompt, user_prompt,
             model=self.config.lead_model,
+            effort=self.config.lead_effort,
             max_budget_usd=self.config.lead_budget,
             cwd=str(self.ws.root),
         )
@@ -148,6 +151,7 @@ class Orchestrator:
         worker_result = self._invoke_and_record(
             graph, task.id, "execute", sys_prompt, user_prompt,
             model=task.assigned_model,
+            effort=self.config.worker_effort,
             allowed_tools=role.allowed_tools if role else None,
             add_dirs=self._resolve_dirs(role) if role else None,
             max_budget_usd=self.config.worker_budget,
@@ -198,6 +202,7 @@ class Orchestrator:
         review = self._invoke_and_record(
             graph, task.id, "review", sys_prompt, user_prompt,
             model=self.config.lead_model,
+            effort=self.config.lead_effort,
             max_budget_usd=self.config.review_budget,
             cwd=str(self.ws.root),
         )
@@ -215,6 +220,7 @@ class Orchestrator:
         result = self._invoke_and_record(
             graph, task.id, "replan", sys_prompt, user_prompt,
             model=self.config.lead_model,
+            effort=self.config.lead_effort,
             max_budget_usd=self.config.review_budget,
             cwd=str(self.ws.root),
         )
@@ -397,6 +403,7 @@ class Orchestrator:
         result = self._invoke_and_record(
             graph, None, "feedback", sys_prompt, user_prompt,
             model=self.config.lead_model,
+            effort=self.config.lead_effort,
             max_budget_usd=self.config.lead_budget,
             cwd=str(self.ws.root),
         )

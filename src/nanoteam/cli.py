@@ -19,8 +19,10 @@ def main() -> None:
     parser.add_argument("--status", action="store_true", help="Print task graph status")
     parser.add_argument("--diagnose", action="store_true", help="AI-assisted diagnosis of current state")
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="Project root directory")
-    parser.add_argument("--lead-model", default="opus", help="Model for Lead agent")
-    parser.add_argument("--worker-model", default="sonnet", help="Default model for workers")
+    parser.add_argument("--lead-model", default="claude-opus-4-6", help="Model for Lead agent")
+    parser.add_argument("--worker-model", default="claude-opus-4-6", help="Default model for workers")
+    parser.add_argument("--lead-effort", default="high", choices=["low", "medium", "high", "max"], help="Effort level for Lead")
+    parser.add_argument("--worker-effort", default="medium", choices=["low", "medium", "high", "max"], help="Effort level for workers")
     parser.add_argument("--max-budget", type=float, default=10.0, help="Total budget in USD")
     parser.add_argument(
         "--checkpoint", default="plan,finish",
@@ -83,6 +85,8 @@ def main() -> None:
     config = Config(
         lead_model=args.lead_model,
         worker_model=args.worker_model,
+        lead_effort=args.lead_effort,
+        worker_effort=args.worker_effort,
         max_budget=args.max_budget,
         checkpoints=checkpoints,
     )
