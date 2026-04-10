@@ -80,20 +80,29 @@ def main() -> None:
             parser.error("Provide a goal or use --resume")
         ws.init(args.goal)
 
+    # Build config: load saved config on resume, CLI args override
+    saved = ws.load_config() if args.resume else None
     checkpoints = set()
     if args.checkpoint != "none":
         checkpoints = {c.strip() for c in args.checkpoint.split(",") if c.strip()}
 
-    config = Config(
-        lead_model=args.lead_model,
-        worker_model=args.worker_model,
-        lead_effort=args.lead_effort,
-        worker_effort=args.worker_effort,
-        max_budget=args.max_budget,
-        timeout=args.timeout,
-        stall_timeout=args.stall_timeout,
-        checkpoints=checkpoints,
-    )
+    if saved:
+        config = Config.from_dict(saved)
+        # CLI explicit overrides (only if user actually passed them)
+        _apply_cli_overrides(config, args, parser, checkpoints)
+    else:
+        config = Config(
+            lead_model=args.lead_model,
+            worker_model=args.worker_model,
+            lead_effort=args.lead_effort,
+            worker_effort=args.worker_effort,
+            max_budget=args.max_budget,
+            timeout=args.timeout,
+            stall_timeout=args.stall_timeout,
+            checkpoints=checkpoints,
+        )
+
+    ws.save_config(config.to_dict())
 
     orch = Orchestrator(ws, config)
     try:
@@ -104,6 +113,31 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n[nanoteam] Interrupted. Use --resume to continue.", file=sys.stderr)
         sys.exit(130)
+
+
+def _apply_cli_overrides(config: Config, args: argparse.Namespace, parser: argparse.ArgumentParser, checkpoints: set[str]) -> None:
+    """Override saved config with explicitly passed CLI args."""
+    defaults = {a.dest: a.default for a in parser._actions}
+    if args.lead_model != defaults.get("lead_model"):
+        config.lead_model = args.lead_model
+    if args.worker_model != defaults.get("worker_model"):
+        config.worker_model = args.worker_model
+    if args.lead_effort != defaults.get("lead_effort"):
+        config.lead_effort = args.lead_effort
+    if args.worker_effort != defaults.get("worker_effort"):
+        config.worker_effort = args.worker_effort
+    if args.max_budget != defaults.get("max_budget"):
+        config.max_budget = args.max_budget
+        # Recalculate derived budgets
+        config.lead_budget = config.max_budget * 0.2
+        config.worker_budget = config.max_budget * 0.1
+        config.review_budget = config.max_budget * 0.05
+    if args.timeout != defaults.get("timeout"):
+        config.timeout = args.timeout
+    if args.stall_timeout != defaults.get("stall_timeout"):
+        config.stall_timeout = args.stall_timeout
+    if args.checkpoint != defaults.get("checkpoint"):
+        config.checkpoints = checkpoints
 
 
 def _collect_all_deps(tasks: dict, target_id: str) -> set[str]:

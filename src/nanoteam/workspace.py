@@ -24,6 +24,17 @@ class Workspace:
     def read_goal(self) -> str:
         return (self.base / "goal.md").read_text()
 
+    # -- Config --
+
+    def save_config(self, config_dict: dict) -> None:
+        self._write(self.base / "config.json", json.dumps(config_dict, indent=2, ensure_ascii=False))
+
+    def load_config(self) -> dict | None:
+        p = self.base / "config.json"
+        if not p.exists():
+            return None
+        return json.loads(p.read_text())
+
     # -- Task Graph --
 
     def load_task_graph(self) -> TaskGraph:

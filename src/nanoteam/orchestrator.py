@@ -42,6 +42,27 @@ class Config:
         if self.review_budget is None:
             self.review_budget = self.max_budget * 0.05
 
+    def to_dict(self) -> dict:
+        return {
+            "lead_model": self.lead_model,
+            "worker_model": self.worker_model,
+            "lead_effort": self.lead_effort,
+            "worker_effort": self.worker_effort,
+            "max_budget": self.max_budget,
+            "lead_budget": self.lead_budget,
+            "worker_budget": self.worker_budget,
+            "review_budget": self.review_budget,
+            "timeout": self.timeout,
+            "stall_timeout": self.stall_timeout,
+            "checkpoints": sorted(self.checkpoints),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> Config:
+        if "checkpoints" in data:
+            data["checkpoints"] = set(data["checkpoints"])
+        return cls(**data)
+
 
 class Orchestrator:
     def __init__(self, workspace: Workspace, config: Config):
