@@ -34,6 +34,17 @@ def main() -> None:
     parser.add_argument("--from", dest="from_task", metavar="TASK_ID", help="Resume from this task (mark all prior as done)")
 
     args = parser.parse_args()
+
+    # Guard against common mistake: `nanoteam resume` instead of `nanoteam --resume`
+    FLAG_LIKE_GOALS = {"resume", "status", "diagnose"}
+    if args.goal and args.goal.lower() in FLAG_LIKE_GOALS:
+        print(
+            f'[nanoteam] Did you mean --{args.goal.lower()}? '
+            f'Use "nanoteam --{args.goal.lower()}" instead of "nanoteam {args.goal}".',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     ws = Workspace(args.root)
 
     if args.status:
