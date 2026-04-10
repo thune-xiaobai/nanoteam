@@ -21,6 +21,10 @@ def main() -> None:
     parser.add_argument("--lead-model", default="opus", help="Model for Lead agent")
     parser.add_argument("--worker-model", default="sonnet", help="Default model for workers")
     parser.add_argument("--max-budget", type=float, default=10.0, help="Total budget in USD")
+    parser.add_argument(
+        "--checkpoint", default="plan,finish",
+        help="Checkpoint timing: comma-separated list of plan,phase,finish,none (default: plan,finish)",
+    )
 
     args = parser.parse_args()
     ws = Workspace(args.root)
@@ -44,10 +48,15 @@ def main() -> None:
             parser.error("Provide a goal or use --resume")
         ws.init(args.goal)
 
+    checkpoints = set()
+    if args.checkpoint != "none":
+        checkpoints = {c.strip() for c in args.checkpoint.split(",") if c.strip()}
+
     config = Config(
         lead_model=args.lead_model,
         worker_model=args.worker_model,
         max_budget=args.max_budget,
+        checkpoints=checkpoints,
     )
 
     orch = Orchestrator(ws, config)

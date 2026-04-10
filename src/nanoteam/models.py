@@ -42,6 +42,7 @@ class TaskGraph:
     tasks: dict[str, Task] = field(default_factory=dict)
     roles: dict[str, Role] = field(default_factory=dict)
     decisions: list[str] = field(default_factory=list)
+    feedback_log: list[str] = field(default_factory=list)
 
     def ready_tasks(self) -> list[Task]:
         ready = []

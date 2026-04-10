@@ -8,6 +8,7 @@ from pathlib import Path
 from .claude import ClaudeResult, invoke_claude
 from .models import Role, Task, TaskGraph, TaskStatus
 from .prompts import (
+    lead_feedback_prompt,
     lead_planning_prompt,
     lead_replan_prompt,
     lead_review_prompt,
@@ -24,6 +25,11 @@ class Config:
     lead_budget: float = 2.0
     worker_budget: float = 1.0
     review_budget: float = 0.5
+    checkpoints: set[str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.checkpoints is None:
+            self.checkpoints = {"plan", "finish"}
 
 
 class Orchestrator:
@@ -38,6 +44,8 @@ class Orchestrator:
         if not graph.tasks:
             graph = self._plan(graph)
             self.ws.save_task_graph(graph)
+            if "plan" in self.config.checkpoints:
+                self._checkpoint(graph, "plan")
 
         while not graph.is_complete():
             self._check_budget()
@@ -55,8 +63,13 @@ class Orchestrator:
                 self._execute_task(graph, task)
                 self.ws.save_task_graph(graph)
 
+            if "phase" in self.config.checkpoints and not graph.is_complete():
+                self._checkpoint(graph, "phase")
+
         if graph.is_complete():
             self._finalize(graph)
+            if "finish" in self.config.checkpoints:
+                self._checkpoint(graph, "finish")
         else:
             _log(f"Stopped. {sum(1 for t in graph.tasks.values() if t.status == TaskStatus.DONE)}/{len(graph.tasks)} tasks done.")
             _log(f"Total cost: ${self.total_cost:.2f}")
@@ -280,6 +293,129 @@ class Orchestrator:
         for d in graph.decisions:
             _log(f"  - {d}")
         _log("=" * 50)
+
+    # -- Checkpoint (client interaction) --
+
+    def _checkpoint(self, graph: TaskGraph, phase: str) -> None:
+        """Pause for client review and feedback."""
+        done = [t for t in graph.tasks.values() if t.status == TaskStatus.DONE]
+        pending = [t for t in graph.tasks.values() if t.status in (TaskStatus.PENDING, TaskStatus.READY)]
+        failed = [t for t in graph.tasks.values() if t.status == TaskStatus.FAILED]
+
+        print(file=sys.stderr)
+        _log(f"{'═' * 20} CHECKPOINT ({phase}) {'═' * 20}")
+        _log(f"Goal: {graph.goal}")
+        _log(f"Cost so far: ${self.total_cost:.2f} / ${self.config.max_budget:.2f}")
+        print(file=sys.stderr)
+
+        if done:
+            _log(f"Completed ({len(done)}):")
+            for t in done:
+                _log(f"  [+] {t.id}: {t.title}")
+        if pending:
+            _log(f"Pending ({len(pending)}):")
+            for t in pending:
+                deps = f" ← depends on {', '.join(t.depends_on)}" if t.depends_on else ""
+                _log(f"  [ ] {t.id}: {t.title}{deps}")
+        if failed:
+            _log(f"Failed ({len(failed)}):")
+            for t in failed:
+                _log(f"  [x] {t.id}: {t.title} (attempt {t.attempt}/{t.max_attempts})")
+
+        if graph.decisions:
+            print(file=sys.stderr)
+            _log("Key decisions:")
+            for d in graph.decisions[-5:]:  # show last 5
+                _log(f"  - {d[:100]}")
+
+        print(file=sys.stderr)
+        _log("Press Enter to continue, or type feedback/new requirements:")
+
+        try:
+            feedback = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            feedback = ""
+
+        if feedback:
+            self._apply_feedback(graph, feedback)
+
+    def _apply_feedback(self, graph: TaskGraph, feedback: str) -> None:
+        """Send client feedback to Lead and apply the resulting plan changes."""
+        _log("Sending feedback to Lead...")
+        graph.feedback_log.append(feedback)
+
+        sys_prompt, user_prompt = lead_feedback_prompt(graph.goal, graph, feedback)
+        result = invoke_claude(
+            user_prompt,
+            system_prompt=sys_prompt,
+            model=self.config.lead_model,
+            max_budget_usd=self.config.lead_budget,
+            cwd=str(self.ws.root),
+        )
+        self.total_cost += result.cost_usd
+
+        if not result.success:
+            _log(f"Lead feedback processing failed: {result.error}")
+            return
+
+        changes = self._parse_json(result.output)
+
+        # Modify existing tasks
+        for mod in changes.get("modify_tasks", []):
+            tid = mod.get("id")
+            if tid and tid in graph.tasks:
+                task = graph.tasks[tid]
+                if task.status in (TaskStatus.PENDING, TaskStatus.READY):
+                    if mod.get("updated_spec"):
+                        self.ws.write_task_spec(tid, mod["updated_spec"])
+                        _log(f"  Updated spec for {tid}")
+                    if mod.get("updated_title"):
+                        task.title = mod["updated_title"]
+                        _log(f"  Updated title for {tid}: {task.title}")
+
+        # Add new tasks
+        for tdata in changes.get("add_tasks", []):
+            task = Task(
+                id=tdata["id"],
+                title=tdata["title"],
+                depends_on=tdata.get("depends_on", []),
+                role=tdata.get("role"),
+                assigned_model=self.config.worker_model,
+            )
+            graph.tasks[task.id] = task
+            self.ws.write_task_spec(task.id, tdata.get("spec", task.title))
+            if tdata.get("context"):
+                ctx = tdata["context"]
+                if isinstance(ctx, list):
+                    ctx = "\n".join(str(c) for c in ctx)
+                self.ws.write_task_context(task.id, str(ctx))
+            _log(f"  Added task {task.id}: {task.title}")
+
+        # Remove pending tasks
+        for tid in changes.get("remove_tasks", []):
+            if tid in graph.tasks and graph.tasks[tid].status in (TaskStatus.PENDING, TaskStatus.READY):
+                del graph.tasks[tid]
+                _log(f"  Removed task {tid}")
+
+        # Add new roles
+        for rdata in changes.get("add_roles", []):
+            role = Role(
+                name=rdata["name"],
+                description=rdata["description"],
+                allowed_tools=rdata.get("allowed_tools", ["Read", "Grep", "Glob", "Edit", "Write", "Bash"]),
+                allowed_dirs=rdata.get("allowed_dirs", []),
+            )
+            graph.roles[role.name] = role
+            self.ws.write_role(role)
+            _log(f"  Added role {role.name}")
+
+        # Record decisions
+        for d in changes.get("decisions", []):
+            graph.decisions.append(d)
+            self.ws.append_decision(d)
+
+        self.ws.save_task_graph(graph)
+        _log("Plan updated based on feedback.")
 
 
 def _log(msg: str) -> None:

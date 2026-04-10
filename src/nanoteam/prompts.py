@@ -207,3 +207,71 @@ Rules:
 4. Summarize what you did and the result.\
 """
     return system, user
+
+
+# -- Lead: Incorporate Client Feedback --
+
+def lead_feedback_prompt(
+    goal: str,
+    graph: TaskGraph,
+    feedback: str,
+) -> tuple[str, str]:
+    tasks_summary = "\n".join(
+        f"- {t.id}: {t.title} [{t.status.value}]"
+        + (f" (role={t.role})" if t.role else "")
+        for t in graph.tasks.values()
+    )
+    decisions_text = "\n".join(f"- {d}" for d in graph.decisions) if graph.decisions else "None yet."
+
+    user = f"""\
+## Project Goal
+
+{goal}
+
+## Current Task Graph
+
+{tasks_summary}
+
+## Architectural Decisions So Far
+
+{decisions_text}
+
+## Client Feedback
+
+The client (who commissioned this project) has provided the following feedback or new requirements:
+
+{feedback}
+
+## Your Job
+
+Incorporate the client's feedback into the current plan. You may:
+1. Modify existing tasks (update their spec)
+2. Add new tasks
+3. Remove tasks that are no longer needed (only pending/ready tasks)
+4. Adjust dependencies
+5. Add new roles if needed
+6. Record decisions
+
+Do NOT modify tasks that are already done or in_progress.
+
+## Output Schema
+
+```json
+{{
+  "modify_tasks": [
+    {{"id": "task-001", "updated_spec": "New spec text", "updated_title": "New title or null"}}
+  ],
+  "add_tasks": [
+    {{"id": "task-XXX", "title": "...", "depends_on": [], "role": "...", "spec": "...", "context": "..."}}
+  ],
+  "remove_tasks": ["task-003"],
+  "add_roles": [
+    {{"name": "role-name", "description": "...", "allowed_tools": ["Read", "Grep", "Glob", "Edit", "Write", "Bash"], "allowed_dirs": []}}
+  ],
+  "decisions": ["Decision: adjusted X because client requested Y"]
+}}
+```
+
+Respond with ONLY the JSON object. Use empty arrays for sections with no changes.\
+"""
+    return LEAD_SYSTEM, user
