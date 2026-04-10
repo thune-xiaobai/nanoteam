@@ -8,6 +8,7 @@ from pathlib import Path
 from .claude import ClaudeResult, invoke_claude
 from .models import Role, Task, TaskGraph, TaskStatus
 from .prompts import (
+    lead_checkpoint_chat_prompt,
     lead_feedback_prompt,
     lead_planning_prompt,
     lead_replan_prompt,
@@ -383,7 +384,31 @@ class Orchestrator:
     # -- Checkpoint (client interaction) --
 
     def _checkpoint(self, graph: TaskGraph, phase: str) -> None:
-        """Pause for client review and feedback."""
+        """Pause for client review and conversational interaction."""
+        self._print_status(graph, phase)
+
+        # Show task specs at plan checkpoint so user can see the full plan
+        if phase == "plan":
+            self._print_plan_details(graph)
+
+        print(file=sys.stderr)
+        _log("Press Enter to continue, or type a question/feedback:")
+
+        # Conversation loop: user can ask questions or give feedback multiple times
+        while True:
+            try:
+                user_input = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+
+            if not user_input:
+                break
+
+            self._handle_checkpoint_input(graph, user_input)
+            print(file=sys.stderr)
+            _log("Press Enter to continue, or type another question/feedback:")
+
+    def _print_status(self, graph: TaskGraph, phase: str) -> None:
         done = [t for t in graph.tasks.values() if t.status == TaskStatus.DONE]
         pending = [t for t in graph.tasks.values() if t.status in (TaskStatus.PENDING, TaskStatus.READY)]
         failed = [t for t in graph.tasks.values() if t.status == TaskStatus.FAILED]
@@ -411,57 +436,60 @@ class Orchestrator:
         if graph.decisions:
             print(file=sys.stderr)
             _log("Key decisions:")
-            for d in graph.decisions[-5:]:  # show last 5
+            for d in graph.decisions[-5:]:
                 _log(f"  - {d[:100]}")
 
-        print(file=sys.stderr)
-        _log("Commands: Enter=continue, ?=show plan details, feedback text=send to Lead")
-
-        try:
-            feedback = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            feedback = ""
-
-        if not feedback:
+    def _print_plan_details(self, graph: TaskGraph) -> None:
+        """Show spec preview for each pending task so user can review the plan."""
+        pending = [t for t in graph.tasks.values() if t.status in (TaskStatus.PENDING, TaskStatus.READY)]
+        if not pending:
             return
 
-        if feedback == "?":
-            self._show_plan_details(graph)
-            # Re-prompt after showing details
-            self._checkpoint(graph, phase)
+        print(file=sys.stderr)
+        _log("─── Plan Details ───")
+        for t in pending:
+            spec = self.ws.read_task_spec(t.id) or ""
+            # Show first 200 chars as preview
+            preview = spec[:200].replace("\n", " ")
+            if len(spec) > 200:
+                preview += "..."
+            _log(f"  {t.id} [{t.role or 'unassigned'}]: {preview}")
+
+    def _handle_checkpoint_input(self, graph: TaskGraph, user_input: str) -> None:
+        """Send user input to Lead for intent classification and response."""
+        graph.feedback_log.append(user_input)
+        self.ws.append_log({"event": "checkpoint_chat", "input": user_input[:200]})
+
+        # Gather task specs for Lead context
+        task_specs = {}
+        for tid in graph.tasks:
+            task_specs[tid] = self.ws.read_task_spec(tid) or ""
+
+        sys_prompt, user_prompt = lead_checkpoint_chat_prompt(
+            graph.goal, graph, task_specs, user_input,
+        )
+        result = self._invoke_and_record(
+            graph, None, "checkpoint_chat", sys_prompt, user_prompt,
+            model=self.config.lead_model,
+            effort=self.config.lead_effort,
+            max_budget_usd=self.config.review_budget,
+            cwd=str(self.ws.root),
+        )
+
+        if not result.success:
+            _log(f"Lead response failed: {result.error}")
             return
 
-        self._apply_feedback(graph, feedback)
+        response = self._parse_json(result.output)
+        resp_type = response.get("type", "answer")
 
-    def _show_plan_details(self, graph: TaskGraph) -> None:
-        """Show detailed plan info without invoking any agents."""
-        print(file=sys.stderr)
-        _log("─── Task Graph ───")
-        for task in graph.tasks.values():
-            deps = f" ← {', '.join(task.depends_on)}" if task.depends_on else ""
-            files = f" [files: {', '.join(task.changed_files)}]" if task.changed_files else ""
-            _log(f"  {task.id}: {task.title}")
-            _log(f"    status={task.status.value} role={task.role} model={task.assigned_model} attempt={task.attempt}{deps}{files}")
-            spec = self.ws.read_task_spec(task.id) if (self.ws.base / "tasks" / task.id / "spec.md").exists() else None
-            if spec:
-                # Show first 3 lines of spec
-                spec_preview = "\n".join(spec.strip().split("\n")[:3])
-                _log(f"    spec: {spec_preview}")
-
-        if graph.roles:
+        if resp_type == "answer":
+            # Just print the answer
             print(file=sys.stderr)
-            _log("─── Roles ───")
-            for role in graph.roles.values():
-                _log(f"  {role.name}: {role.description[:100]}")
-
-        if graph.decisions:
-            print(file=sys.stderr)
-            _log("─── Decisions ───")
-            for d in graph.decisions:
-                _log(f"  - {d[:120]}")
-
-        _log(f"\nConfig: lead={self.config.lead_model} worker={self.config.worker_model} budget=${self.config.max_budget:.0f}")
-        print(file=sys.stderr)
+            _log(f"Lead: {response.get('content', '(no response)')}")
+        else:
+            # Apply plan modifications
+            self._apply_plan_changes(graph, response)
 
     def _apply_feedback(self, graph: TaskGraph, feedback: str) -> None:
         """Send client feedback to Lead and apply the resulting plan changes."""
@@ -482,8 +510,10 @@ class Orchestrator:
             _log(f"Lead feedback processing failed: {result.error}")
             return
 
-        changes = self._parse_json(result.output)
+        self._apply_plan_changes(graph, self._parse_json(result.output))
 
+    def _apply_plan_changes(self, graph: TaskGraph, changes: dict) -> None:
+        """Apply plan modifications from Lead response."""
         # Modify existing tasks
         for mod in changes.get("modify_tasks", []):
             tid = mod.get("id")
@@ -539,7 +569,11 @@ class Orchestrator:
             self.ws.append_decision(d)
 
         self.ws.save_task_graph(graph)
-        _log("Plan updated based on feedback.")
+
+        content = changes.get("content", "")
+        if content:
+            _log(f"Lead: {content}")
+        _log("Plan updated.")
 
 
 def _log(msg: str) -> None:

@@ -248,6 +248,73 @@ Rules:
     return system, user
 
 
+# -- Lead: Checkpoint Chat (answer questions or modify plan) --
+
+def lead_checkpoint_chat_prompt(
+    goal: str,
+    graph: TaskGraph,
+    task_specs: dict[str, str],
+    user_input: str,
+) -> tuple[str, str]:
+    tasks_detail = []
+    for t in graph.tasks.values():
+        spec_preview = task_specs.get(t.id, "")
+        deps = f" (depends on {', '.join(t.depends_on)})" if t.depends_on else ""
+        tasks_detail.append(
+            f"### {t.id}: {t.title} [{t.status.value}]{deps}\n"
+            f"Role: {t.role or 'unassigned'}\n"
+            f"Spec:\n{spec_preview}"
+        )
+    tasks_text = "\n\n".join(tasks_detail)
+    decisions_text = "\n".join(f"- {d}" for d in graph.decisions) if graph.decisions else "None yet."
+
+    user = f"""\
+## Project Goal
+
+{goal}
+
+## Current Plan
+
+{tasks_text}
+
+## Architectural Decisions
+
+{decisions_text}
+
+## Client Message
+
+{user_input}
+
+## Your Job
+
+The client sent a message at a checkpoint. It could be:
+- A question about the plan (what, why, how) → answer it clearly
+- Feedback or new requirements → modify the plan accordingly
+
+Determine the intent and respond.
+
+## Output Schema
+
+```json
+{{
+  "type": "answer" or "modify",
+  "content": "Your answer to the client's question (only when type=answer)",
+  "modify_tasks": [],
+  "add_tasks": [],
+  "remove_tasks": [],
+  "add_roles": [],
+  "decisions": []
+}}
+```
+
+If type is "answer", set all modify/add/remove arrays to empty.
+If type is "modify", set content to a brief summary of what you changed.
+
+Respond with ONLY the JSON object.\
+"""
+    return LEAD_SYSTEM, user
+
+
 # -- Lead: Incorporate Client Feedback --
 
 def lead_feedback_prompt(
