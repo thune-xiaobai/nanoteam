@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import Role, Task, TaskGraph
@@ -78,6 +79,66 @@ class Workspace:
     def read_decisions(self) -> str:
         p = self.base / "decisions.md"
         return p.read_text() if p.exists() else ""
+
+    # -- Event log --
+
+    def append_log(self, event: dict) -> None:
+        """Append a structured event to log.jsonl."""
+        event["ts"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        p = self.base / "log.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def read_log(self) -> list[dict]:
+        """Read all events from log.jsonl."""
+        p = self.base / "log.jsonl"
+        if not p.exists():
+            return []
+        events = []
+        for line in p.read_text().splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+        return events
+
+    # -- Turn recording --
+
+    def write_turn(
+        self,
+        task_id: str | None,
+        turn_num: int,
+        phase: str,
+        prompt: str,
+        response: str,
+        system_prompt: str = "",
+    ) -> tuple[str, str]:
+        """Write prompt and response for an invoke_claude call. Returns (prompt_path, response_path) relative to .nanoteam/."""
+        if task_id:
+            base_dir = self._task_dir(task_id) / "turns"
+        else:
+            base_dir = self.base / "turns"
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        prefix = f"{turn_num:03d}-{phase}"
+        prompt_file = base_dir / f"{prefix}-prompt.md"
+        response_file = base_dir / f"{prefix}-response.md"
+
+        prompt_content = ""
+        if system_prompt:
+            prompt_content += f"## System Prompt\n\n{system_prompt}\n\n---\n\n"
+        prompt_content += f"## User Prompt\n\n{prompt}"
+
+        self._write(prompt_file, prompt_content)
+        self._write(response_file, response)
+
+        return (
+            str(prompt_file.relative_to(self.base)),
+            str(response_file.relative_to(self.base)),
+        )
 
     # -- File snapshots --
 

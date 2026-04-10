@@ -17,6 +17,7 @@ def main() -> None:
     parser.add_argument("goal", nargs="?", help="High-level objective")
     parser.add_argument("--resume", action="store_true", help="Resume from .nanoteam/ state")
     parser.add_argument("--status", action="store_true", help="Print task graph status")
+    parser.add_argument("--diagnose", action="store_true", help="AI-assisted diagnosis of current state")
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="Project root directory")
     parser.add_argument("--lead-model", default="opus", help="Model for Lead agent")
     parser.add_argument("--worker-model", default="sonnet", help="Default model for workers")
@@ -25,12 +26,18 @@ def main() -> None:
         "--checkpoint", default="plan,finish",
         help="Checkpoint timing: comma-separated list of plan,phase,finish,none (default: plan,finish)",
     )
+    parser.add_argument("--skip", nargs="*", metavar="TASK_ID", help="Mark these tasks as done when resuming")
+    parser.add_argument("--from", dest="from_task", metavar="TASK_ID", help="Resume from this task (mark all prior as done)")
 
     args = parser.parse_args()
     ws = Workspace(args.root)
 
     if args.status:
         _print_status(ws)
+        return
+
+    if args.diagnose:
+        _diagnose(ws, args)
         return
 
     if args.resume:
@@ -42,6 +49,27 @@ def main() -> None:
         for task in graph.tasks.values():
             if task.status == TaskStatus.IN_PROGRESS:
                 task.status = TaskStatus.READY
+
+        # --skip: force specific tasks to DONE
+        if args.skip:
+            for tid in args.skip:
+                if tid in graph.tasks:
+                    graph.tasks[tid].status = TaskStatus.DONE
+                    print(f"[nanoteam] Skipped {tid}: {graph.tasks[tid].title}", file=sys.stderr)
+                else:
+                    print(f"[nanoteam] Warning: task {tid} not found", file=sys.stderr)
+
+        # --from: mark everything before this task as DONE
+        if args.from_task:
+            if args.from_task not in graph.tasks:
+                print(f"[nanoteam] Error: task {args.from_task} not found", file=sys.stderr)
+                sys.exit(1)
+            target_deps = _collect_all_deps(graph.tasks, args.from_task)
+            for tid in target_deps:
+                if graph.tasks[tid].status != TaskStatus.DONE:
+                    graph.tasks[tid].status = TaskStatus.DONE
+                    print(f"[nanoteam] Auto-completed {tid}: {graph.tasks[tid].title}", file=sys.stderr)
+
         ws.save_task_graph(graph)
     else:
         if not args.goal:
@@ -70,6 +98,18 @@ def main() -> None:
         sys.exit(130)
 
 
+def _collect_all_deps(tasks: dict, target_id: str) -> set[str]:
+    """Recursively collect all transitive dependencies of target_id."""
+    deps: set[str] = set()
+    stack = list(tasks[target_id].depends_on)
+    while stack:
+        tid = stack.pop()
+        if tid not in deps and tid in tasks:
+            deps.add(tid)
+            stack.extend(tasks[tid].depends_on)
+    return deps
+
+
 def _print_status(ws: Workspace) -> None:
     if not (ws.base / "task_graph.json").exists():
         print("No .nanoteam/ state found.")
@@ -79,6 +119,7 @@ def _print_status(ws: Workspace) -> None:
     print(f"Goal: {graph.goal}")
     print(f"Tasks: {len(graph.tasks)}")
     print(f"Roles: {', '.join(graph.roles.keys()) or 'none'}")
+    print(f"Total cost: ${graph.total_cost:.2f}")
     print()
 
     status_counts: dict[str, int] = {}
@@ -91,6 +132,85 @@ def _print_status(ws: Workspace) -> None:
     print()
     for status, count in sorted(status_counts.items()):
         print(f"  {status}: {count}")
+
+
+def _diagnose(ws: Workspace, args: argparse.Namespace) -> None:
+    if not (ws.base / "task_graph.json").exists():
+        print("No .nanoteam/ state found.", file=sys.stderr)
+        sys.exit(1)
+
+    from .claude import invoke_claude
+    from .prompts import lead_diagnose_prompt
+
+    graph = ws.load_task_graph()
+
+    # Build task graph summary
+    lines = [f"Goal: {graph.goal}", f"Total cost: ${graph.total_cost:.2f}", ""]
+    for task in graph.tasks.values():
+        deps = f" (depends: {', '.join(task.depends_on)})" if task.depends_on else ""
+        files = f" [changed: {', '.join(task.changed_files)}]" if task.changed_files else ""
+        lines.append(f"  {task.id}: {task.title} [{task.status.value}] attempt={task.attempt}{deps}{files}")
+    graph_summary = "\n".join(lines)
+
+    # Recent events from log
+    events = ws.read_log()
+    recent = events[-30:] if len(events) > 30 else events
+    import json
+    recent_events = "\n".join(json.dumps(e, ensure_ascii=False) for e in recent)
+
+    # Recent turns (last few response files)
+    recent_turns = _gather_recent_turns(ws, graph)
+
+    sys_prompt, user_prompt = lead_diagnose_prompt(
+        graph.goal, graph_summary, recent_events, recent_turns,
+    )
+
+    print("[nanoteam] Running diagnosis...", file=sys.stderr)
+    result = invoke_claude(
+        user_prompt,
+        system_prompt=sys_prompt,
+        model=args.lead_model,
+        max_budget_usd=1.0,
+        cwd=str(ws.root),
+    )
+
+    if result.success:
+        print(result.output)
+    else:
+        print(f"Diagnosis failed: {result.error}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"\n[nanoteam] Diagnosis cost: ${result.cost_usd:.2f}", file=sys.stderr)
+
+
+def _gather_recent_turns(ws: Workspace, graph) -> str:
+    """Gather the most recent turn responses for context."""
+    parts: list[str] = []
+    turns_dir = ws.base / "turns"
+
+    # Global turns (planning, feedback)
+    if turns_dir.exists():
+        for f in sorted(turns_dir.glob("*-response.md"))[-3:]:
+            content = f.read_text()
+            if len(content) > 3000:
+                content = content[:3000] + "\n... (truncated)"
+            parts.append(f"### {f.name}\n{content}")
+
+    # Per-task turns (most recent failed/in-progress tasks first)
+    priority_tasks = [
+        t for t in graph.tasks.values()
+        if t.status in (TaskStatus.FAILED, TaskStatus.IN_PROGRESS, TaskStatus.REVIEW)
+    ]
+    for task in priority_tasks[:3]:
+        task_turns = ws.base / "tasks" / task.id / "turns"
+        if task_turns.exists():
+            for f in sorted(task_turns.glob("*-response.md"))[-2:]:
+                content = f.read_text()
+                if len(content) > 3000:
+                    content = content[:3000] + "\n... (truncated)"
+                parts.append(f"### {task.id}/{f.name}\n{content}")
+
+    return "\n\n".join(parts) if parts else "No turns recorded yet."
 
 
 if __name__ == "__main__":

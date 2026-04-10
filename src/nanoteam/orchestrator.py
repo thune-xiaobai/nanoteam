@@ -37,9 +37,11 @@ class Orchestrator:
         self.ws = workspace
         self.config = config
         self.total_cost = 0.0
+        self._turn_counter = 0
 
     def run(self) -> None:
         graph = self.ws.load_task_graph()
+        self.total_cost = graph.total_cost
 
         if not graph.tasks:
             graph = self._plan(graph)
@@ -76,16 +78,15 @@ class Orchestrator:
 
     def _plan(self, graph: TaskGraph) -> TaskGraph:
         _log("Planning: asking Lead to decompose the goal...")
+        self.ws.append_log({"event": "plan_start", "goal": graph.goal})
 
         sys_prompt, user_prompt = lead_planning_prompt(graph.goal)
-        result = invoke_claude(
-            user_prompt,
-            system_prompt=sys_prompt,
+        result = self._invoke_and_record(
+            graph, None, "plan", sys_prompt, user_prompt,
             model=self.config.lead_model,
             max_budget_usd=self.config.lead_budget,
             cwd=str(self.ws.root),
         )
-        self.total_cost += result.cost_usd
 
         if not result.success:
             _log(f"Lead planning failed: {result.error}")
@@ -124,10 +125,12 @@ class Orchestrator:
             self.ws.append_decision(d)
 
         _log(f"Plan created: {len(graph.tasks)} tasks, {len(graph.roles)} roles")
+        self.ws.append_log({"event": "plan_done", "tasks": len(graph.tasks), "roles": len(graph.roles), "cost": self.total_cost})
         return graph
 
     def _execute_task(self, graph: TaskGraph, task: Task) -> None:
         _log(f"Executing {task.id}: {task.title} (role={task.role}, model={task.assigned_model})")
+        self.ws.append_log({"event": "task_start", "task_id": task.id, "role": task.role})
 
         task.status = TaskStatus.IN_PROGRESS
         self.ws.save_task_graph(graph)
@@ -142,16 +145,14 @@ class Orchestrator:
 
         sys_prompt, user_prompt = worker_prompt(spec, context, role_def)
 
-        worker_result = invoke_claude(
-            user_prompt,
-            system_prompt=sys_prompt,
+        worker_result = self._invoke_and_record(
+            graph, task.id, "execute", sys_prompt, user_prompt,
             model=task.assigned_model,
             allowed_tools=role.allowed_tools if role else None,
             add_dirs=self._resolve_dirs(role) if role else None,
             max_budget_usd=self.config.worker_budget,
             cwd=str(self.ws.root),
         )
-        self.total_cost += worker_result.cost_usd
 
         # Snapshot after and record changed files
         after = self.ws.snapshot_files()
@@ -171,6 +172,7 @@ class Orchestrator:
         if verdict.get("verdict") == "accept":
             task.status = TaskStatus.DONE
             _log(f"Task {task.id} accepted: {verdict.get('reason', '')[:80]}")
+            self.ws.append_log({"event": "task_done", "task_id": task.id, "verdict": "accept"})
             if verdict.get("decision"):
                 graph.decisions.append(verdict["decision"])
                 self.ws.append_decision(verdict["decision"])
@@ -178,6 +180,7 @@ class Orchestrator:
             task.status = TaskStatus.FAILED
             task.attempt += 1
             _log(f"Task {task.id} rejected (attempt {task.attempt}/{task.max_attempts}): {verdict.get('reason', '')[:80]}")
+            self.ws.append_log({"event": "task_rejected", "task_id": task.id, "attempt": task.attempt, "reason": verdict.get("reason", "")[:200]})
             if task.attempt < task.max_attempts:
                 self._replan_task(graph, task, verdict.get("reason", "Unknown"))
             else:
@@ -192,14 +195,12 @@ class Orchestrator:
         sys_prompt, user_prompt = lead_review_prompt(
             graph.goal, task, spec, result, graph.decisions,
         )
-        review = invoke_claude(
-            user_prompt,
-            system_prompt=sys_prompt,
+        review = self._invoke_and_record(
+            graph, task.id, "review", sys_prompt, user_prompt,
             model=self.config.lead_model,
             max_budget_usd=self.config.review_budget,
             cwd=str(self.ws.root),
         )
-        self.total_cost += review.cost_usd
 
         if not review.success:
             _log(f"Review failed, auto-accepting: {review.error}")
@@ -211,14 +212,12 @@ class Orchestrator:
         _log(f"Replanning {task.id}...")
 
         sys_prompt, user_prompt = lead_replan_prompt(graph.goal, graph, task, reason)
-        result = invoke_claude(
-            user_prompt,
-            system_prompt=sys_prompt,
+        result = self._invoke_and_record(
+            graph, task.id, "replan", sys_prompt, user_prompt,
             model=self.config.lead_model,
             max_budget_usd=self.config.review_budget,
             cwd=str(self.ws.root),
         )
-        self.total_cost += result.cost_usd
 
         if not result.success:
             _log(f"Replan failed: {result.error}. Retrying with same spec.")
@@ -269,6 +268,55 @@ class Orchestrator:
             raise RuntimeError(
                 f"Budget exhausted: ${self.total_cost:.2f} >= ${self.config.max_budget:.2f}"
             )
+
+    def _invoke_and_record(
+        self,
+        graph: TaskGraph,
+        task_id: str | None,
+        phase: str,
+        sys_prompt: str,
+        user_prompt: str,
+        **kwargs,
+    ) -> ClaudeResult:
+        """Invoke Claude with full turn recording and logging."""
+        self._turn_counter += 1
+        turn = self._turn_counter
+
+        self.ws.append_log({
+            "event": "invoke_claude",
+            "task_id": task_id,
+            "phase": phase,
+            "model": kwargs.get("model", "?"),
+            "turn": turn,
+        })
+
+        result = invoke_claude(
+            user_prompt,
+            system_prompt=sys_prompt,
+            **kwargs,
+        )
+        self.total_cost += result.cost_usd
+        graph.total_cost = self.total_cost
+        self.ws.save_task_graph(graph)
+
+        prompt_path, response_path = self.ws.write_turn(
+            task_id, turn, phase,
+            user_prompt, result.output or result.error or "",
+            system_prompt=sys_prompt,
+        )
+
+        self.ws.append_log({
+            "event": "invoke_result",
+            "task_id": task_id,
+            "phase": phase,
+            "success": result.success,
+            "cost": result.cost_usd,
+            "duration_s": result.duration_s,
+            "prompt_file": prompt_path,
+            "response_file": response_path,
+        })
+
+        return result
 
     def _parse_json(self, text: str) -> dict:
         text = text.strip()
@@ -343,16 +391,15 @@ class Orchestrator:
         """Send client feedback to Lead and apply the resulting plan changes."""
         _log("Sending feedback to Lead...")
         graph.feedback_log.append(feedback)
+        self.ws.append_log({"event": "feedback", "input": feedback[:200]})
 
         sys_prompt, user_prompt = lead_feedback_prompt(graph.goal, graph, feedback)
-        result = invoke_claude(
-            user_prompt,
-            system_prompt=sys_prompt,
+        result = self._invoke_and_record(
+            graph, None, "feedback", sys_prompt, user_prompt,
             model=self.config.lead_model,
             max_budget_usd=self.config.lead_budget,
             cwd=str(self.ws.root),
         )
-        self.total_cost += result.cost_usd
 
         if not result.success:
             _log(f"Lead feedback processing failed: {result.error}")

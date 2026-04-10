@@ -43,6 +43,7 @@ class TaskGraph:
     roles: dict[str, Role] = field(default_factory=dict)
     decisions: list[str] = field(default_factory=list)
     feedback_log: list[str] = field(default_factory=list)
+    total_cost: float = 0.0
 
     def ready_tasks(self) -> list[Task]:
         ready = []
@@ -71,6 +72,8 @@ class TaskGraph:
         for rname, rdata in data.get("roles", {}).items():
             graph.roles[rname] = Role(**rdata)
         graph.decisions = data.get("decisions", [])
+        graph.feedback_log = data.get("feedback_log", [])
+        graph.total_cost = data.get("total_cost", 0.0)
         return graph
 
     def to_json(self) -> str:

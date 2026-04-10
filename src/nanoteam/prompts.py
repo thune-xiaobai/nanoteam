@@ -171,6 +171,45 @@ Respond with ONLY the JSON object.\
     return LEAD_SYSTEM, user
 
 
+# -- Lead: Diagnose --
+
+def lead_diagnose_prompt(
+    goal: str,
+    graph_summary: str,
+    recent_events: str,
+    recent_turns: str,
+) -> tuple[str, str]:
+    user = f"""\
+## Project Goal
+
+{goal}
+
+## Task Graph Summary
+
+{graph_summary}
+
+## Recent Events (from log.jsonl)
+
+{recent_events}
+
+## Recent Prompt/Response Turns
+
+{recent_turns}
+
+## Your Job
+
+Analyze the current state and recent history of this project. Identify:
+
+1. What went wrong (if anything) — look for failures, rejections, errors, JSON parse issues
+2. Where the project is stuck (if it is) — deadlocks, repeated failures, budget issues
+3. What the likely root cause is
+4. Recommended next steps — retry, skip a task, adjust the plan, increase budget, etc.
+
+Be specific: reference task IDs, error messages, and concrete actions.\
+"""
+    return LEAD_SYSTEM, user
+
+
 # -- Worker --
 
 def worker_prompt(
