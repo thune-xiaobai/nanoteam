@@ -355,8 +355,15 @@ class Orchestrator:
         spec = self.ws.read_task_spec(task.id)
         result = self.ws.read_task_result(task.id) or "No result."
 
+        # Pre-check: if worker claims file changes but none actually happened, auto-reject
+        if not task.changed_files and _claims_file_changes(result):
+            reason = "Worker claimed file changes but no files were actually modified."
+            _log(f"  Auto-rejecting {task.id}: {reason}")
+            return {"verdict": "reject", "reason": reason}
+
         sys_prompt, user_prompt = lead_review_prompt(
             graph.goal, task, spec, result, graph.decisions,
+            changed_files=task.changed_files,
         )
         review = self._invoke_and_record(
             graph, task.id, "review", sys_prompt, user_prompt,
@@ -720,3 +727,17 @@ class Orchestrator:
 
 def _log(msg: str) -> None:
     print(f"[nanoteam] {msg}", file=sys.stderr)
+
+
+import re
+
+_FILE_CHANGE_PATTERN = re.compile(
+    r'\b(?:creat|writ|wrote|generat|added|built)\w*\s+.*?'
+    r'(?:\.\w{1,5}\b|/\w+)',
+    re.IGNORECASE,
+)
+
+
+def _claims_file_changes(result: str) -> bool:
+    """Heuristic: does the result text claim to have created/written files?"""
+    return bool(_FILE_CHANGE_PATTERN.search(result))

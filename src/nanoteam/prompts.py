@@ -78,8 +78,13 @@ def lead_review_prompt(
     spec: str,
     result: str,
     decisions: list[str],
+    changed_files: list[str] | None = None,
 ) -> tuple[str, str]:
     decisions_text = "\n".join(f"- {d}" for d in decisions) if decisions else "None yet."
+    if changed_files:
+        changed_text = "\n".join(f"- {f}" for f in changed_files)
+    else:
+        changed_text = "No files were changed."
 
     user = f"""\
 ## Project Goal
@@ -104,9 +109,17 @@ def lead_review_prompt(
 
 {result}
 
+## Actual File Changes (verified by system)
+
+{changed_text}
+
 ## Your Job
 
 Review the worker's result against the specification and acceptance criteria.
+
+IMPORTANT: Cross-check the worker's claimed deliverables against the actual file changes listed \
+above. If the worker claims to have created or modified files that do NOT appear in the actual \
+changes, REJECT the result — the worker did not actually produce those files.
 
 ## Output Schema
 
