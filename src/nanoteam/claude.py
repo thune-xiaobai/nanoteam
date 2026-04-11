@@ -19,6 +19,7 @@ class ClaudeResult:
     duration_s: float = 0
     error: str | None = None
     session_id: str | None = None
+    had_activity: bool = False
 
 
 def invoke_claude(
@@ -73,6 +74,7 @@ def invoke_claude(
 
     result_data: dict | None = None
     last_activity = time.monotonic()
+    activity_count = 0
     buf = b""
 
     try:
@@ -95,16 +97,18 @@ def invoke_claude(
                     success=False, output="", cost_usd=0,
                     duration_s=elapsed,
                     error=f"Timeout after {elapsed:.0f}s",
+                    had_activity=activity_count > 0,
                 )
 
             if idle >= stall_timeout:
                 proc.kill()
                 proc.wait()
-                _log(f"  STALLED: no output for {idle:.0f}s (elapsed {elapsed:.0f}s)")
+                _log(f"  STALLED: no output for {idle:.0f}s (elapsed {elapsed:.0f}s, activity={activity_count})")
                 return ClaudeResult(
                     success=False, output="", cost_usd=0,
                     duration_s=elapsed,
                     error=f"Stalled: no output for {idle:.0f}s",
+                    had_activity=activity_count > 0,
                 )
 
             if not ready:
@@ -134,6 +138,7 @@ def invoke_claude(
 
                 if etype == "assistant":
                     _process_assistant_event(event)
+                    activity_count += 1
                 elif etype == "result":
                     result_data = event
 
@@ -170,6 +175,7 @@ def invoke_claude(
             duration_s=duration,
             error=error_msg,
             session_id=session_id,
+            had_activity=activity_count > 0,
         )
 
     # Fallback: no result event found
@@ -179,6 +185,7 @@ def invoke_claude(
         success=False, output="", cost_usd=0,
         duration_s=duration,
         error=stderr or f"No result event, exit code {proc.returncode}",
+        had_activity=activity_count > 0,
     )
 
 
@@ -267,6 +274,7 @@ def resume_claude(
 
     result_data: dict | None = None
     last_activity = time.monotonic()
+    activity_count = 0
     buf = b""
 
     try:
@@ -288,6 +296,7 @@ def resume_claude(
                     duration_s=elapsed,
                     error=f"Timeout after {elapsed:.0f}s",
                     session_id=session_id,
+                    had_activity=activity_count > 0,
                 )
 
             if idle >= stall_timeout:
@@ -298,6 +307,7 @@ def resume_claude(
                     duration_s=elapsed,
                     error=f"Stalled: no output for {idle:.0f}s",
                     session_id=session_id,
+                    had_activity=activity_count > 0,
                 )
 
             if not ready:
@@ -323,6 +333,7 @@ def resume_claude(
                 etype = event.get("type", "")
                 if etype == "assistant":
                     _process_assistant_event(event)
+                    activity_count += 1
                 elif etype == "result":
                     result_data = event
 
@@ -353,6 +364,7 @@ def resume_claude(
             duration_s=duration,
             error=error_msg,
             session_id=session_id,
+            had_activity=activity_count > 0,
         )
 
     stderr = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
@@ -361,4 +373,5 @@ def resume_claude(
         duration_s=duration,
         error=stderr or f"No result event, exit code {proc.returncode}",
         session_id=session_id,
+        had_activity=activity_count > 0,
     )
