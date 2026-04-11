@@ -81,6 +81,11 @@ class Orchestrator:
             self.ws.save_task_graph(graph)
             if "plan" in self.config.checkpoints:
                 self._checkpoint(graph, "plan")
+        else:
+            # Resume: re-show plan checkpoint if no tasks have completed yet
+            done = any(t.status == TaskStatus.DONE for t in graph.tasks.values())
+            if not done and "plan" in self.config.checkpoints:
+                self._checkpoint(graph, "plan")
 
         while not graph.is_complete():
             self._check_budget()
