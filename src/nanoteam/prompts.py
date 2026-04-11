@@ -287,11 +287,14 @@ def lead_checkpoint_chat_prompt(
 
 ## Your Job
 
-The client sent a message at a checkpoint. It could be:
-- A question about the plan (what, why, how) → answer it clearly
+The client sent a message at a checkpoint. You already have the full plan context above — goal, every task spec, and all architectural decisions. Use this context to respond.
+
+Classify the client's intent:
+- "?" or vague/short input → summarize the plan: what will be done, in what order, and why
+- A specific question about the plan (what, why, how) → answer it from the context above
 - Feedback or new requirements → modify the plan accordingly
 
-Determine the intent and respond.
+IMPORTANT: Answer from the context you already have. Do NOT explore the codebase or use tools unless the client explicitly references a specific file or resource not covered in the plan above.
 
 ## Output Schema
 
