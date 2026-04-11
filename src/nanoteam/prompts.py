@@ -22,7 +22,7 @@ def lead_planning_prompt(goal: str) -> tuple[str, str]:
 
 ## Your Job
 
-Analyze this objective and produce a development plan.
+Analyze this objective and produce a development plan. If this is a greenfield project (building something new from scratch), plan directly from your knowledge — do NOT explore the filesystem. Only use tools to examine existing code when the objective requires modifying or extending an existing codebase.
 
 1. Break it into concrete, implementable tasks (3-10 tasks).
 2. Define roles needed (each role has a name, description, allowed_tools, allowed_dirs).
