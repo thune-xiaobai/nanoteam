@@ -87,6 +87,9 @@ class Orchestrator:
             if not done and "plan" in self.config.checkpoints:
                 self._checkpoint(graph, "plan")
 
+            # Resume interrupted tasks via their Claude sessions
+            self._resume_interrupted_tasks(graph)
+
         while not graph.is_complete():
             self._check_budget()
 
@@ -118,6 +121,27 @@ class Orchestrator:
         _log("Planning: asking Lead to decompose the goal...")
         self.ws.append_log({"event": "plan_start", "goal": graph.goal})
 
+        # Resume previous planning session if available
+        if graph.plan_session_id:
+            _log(f"Resuming planning session {graph.plan_session_id[:8]}...")
+            result = resume_claude(
+                graph.plan_session_id,
+                "You were interrupted during planning. Please output the complete JSON plan now. "
+                "Output ONLY the JSON object matching the schema, with no extra text.",
+                model=self.config.lead_model,
+                cwd=str(self.ws.root),
+                timeout=self.config.timeout,
+                stall_timeout=self.config.stall_timeout,
+            )
+            self.total_cost += result.cost_usd
+            graph.total_cost = self.total_cost
+            if result.success:
+                plan = self._parse_json(result.output)
+                if plan.get("tasks"):
+                    return self._apply_plan(graph, plan)
+            _log("Planning session resume failed, starting fresh...")
+            graph.plan_session_id = None
+
         sys_prompt, user_prompt = lead_planning_prompt(graph.goal)
         result = self._invoke_and_record(
             graph, None, "plan", sys_prompt, user_prompt,
@@ -130,6 +154,11 @@ class Orchestrator:
         if not result.success:
             _log(f"Lead planning failed: {result.error}")
             raise RuntimeError(f"Planning failed: {result.error}")
+
+        # Save session for potential resume
+        if result.session_id:
+            graph.plan_session_id = result.session_id
+            self.ws.save_task_graph(graph)
 
         plan = self._parse_json(result.output)
 
@@ -153,6 +182,10 @@ class Orchestrator:
             _log(f"Lead returned no tasks. Raw output: {(result.output or '')[:200]}")
             raise RuntimeError("Planning produced no tasks")
 
+        return self._apply_plan(graph, plan)
+
+    def _apply_plan(self, graph: TaskGraph, plan: dict) -> TaskGraph:
+        """Apply a parsed plan dict to the task graph."""
         for tdata in plan.get("tasks", []):
             task = Task(
                 id=tdata["id"],
@@ -187,6 +220,54 @@ class Orchestrator:
         self.ws.append_log({"event": "plan_done", "tasks": len(graph.tasks), "roles": len(graph.roles), "cost": self.total_cost})
         return graph
 
+    def _resume_interrupted_tasks(self, graph: TaskGraph) -> None:
+        """Resume tasks that were IN_PROGRESS when the previous run was interrupted."""
+        interrupted = [t for t in graph.tasks.values() if t.status == TaskStatus.IN_PROGRESS]
+        for task in interrupted:
+            if not task.session_id:
+                _log(f"Task {task.id} has no session_id, resetting to READY")
+                task.status = TaskStatus.READY
+                self.ws.save_task_graph(graph)
+                continue
+
+            _log(f"Resuming {task.id}: {task.title} (session {task.session_id[:8]}...)")
+            self.ws.append_log({"event": "task_resume", "task_id": task.id, "session_id": task.session_id})
+
+            before = self.ws.snapshot_files()
+            result = resume_claude(
+                task.session_id,
+                "You were interrupted. Continue and complete your task. "
+                "Output your final result when done.",
+                model=task.assigned_model,
+                cwd=str(self.ws.root),
+                timeout=self.config.timeout,
+                stall_timeout=self.config.stall_timeout,
+            )
+            self.total_cost += result.cost_usd
+            graph.total_cost = self.total_cost
+
+            after = self.ws.snapshot_files()
+            task.changed_files = self.ws.diff_files(before, after)
+
+            if not result.success:
+                _log(f"Resume failed for {task.id}: {result.error}, resetting to READY")
+                task.status = TaskStatus.READY
+                task.session_id = None
+            else:
+                self.ws.write_task_result(task.id, result.output)
+                task.status = TaskStatus.REVIEW
+                verdict = self._review(graph, task)
+                if verdict.get("verdict") == "accept":
+                    task.status = TaskStatus.DONE
+                    _log(f"Task {task.id} accepted: {verdict.get('reason', '')[:80]}")
+                    self.ws.append_log({"event": "task_done", "task_id": task.id, "verdict": "accept"})
+                else:
+                    task.status = TaskStatus.FAILED
+                    task.attempt += 1
+                    _log(f"Task {task.id} rejected after resume: {verdict.get('reason', '')[:80]}")
+
+            self.ws.save_task_graph(graph)
+
     def _execute_task(self, graph: TaskGraph, task: Task) -> None:
         _log(f"Executing {task.id}: {task.title} (role={task.role}, model={task.assigned_model})")
         self.ws.append_log({"event": "task_start", "task_id": task.id, "role": task.role})
@@ -213,6 +294,11 @@ class Orchestrator:
             max_budget_usd=self.config.worker_budget,
             cwd=str(self.ws.root),
         )
+
+        # Save session_id for potential resume
+        if worker_result.session_id:
+            task.session_id = worker_result.session_id
+            self.ws.save_task_graph(graph)
 
         # Snapshot after and record changed files
         after = self.ws.snapshot_files()

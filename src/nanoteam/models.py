@@ -26,6 +26,7 @@ class Task:
     attempt: int = 0
     max_attempts: int = 3
     changed_files: list[str] = field(default_factory=list)
+    session_id: str | None = None
 
 
 @dataclass
@@ -44,6 +45,7 @@ class TaskGraph:
     decisions: list[str] = field(default_factory=list)
     feedback_log: list[str] = field(default_factory=list)
     total_cost: float = 0.0
+    plan_session_id: str | None = None
 
     def ready_tasks(self) -> list[Task]:
         ready = []
@@ -74,6 +76,7 @@ class TaskGraph:
         graph.decisions = data.get("decisions", [])
         graph.feedback_log = data.get("feedback_log", [])
         graph.total_cost = data.get("total_cost", 0.0)
+        graph.plan_session_id = data.get("plan_session_id")
         return graph
 
     def to_json(self) -> str:

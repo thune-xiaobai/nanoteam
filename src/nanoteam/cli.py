@@ -60,10 +60,7 @@ def main() -> None:
             print("No .nanoteam/ state found. Start with a goal first.", file=sys.stderr)
             sys.exit(1)
         graph = ws.load_task_graph()
-        # Reset any IN_PROGRESS tasks back to READY (interrupted run)
-        for task in graph.tasks.values():
-            if task.status == TaskStatus.IN_PROGRESS:
-                task.status = TaskStatus.READY
+        # IN_PROGRESS tasks with session_ids will be resumed by the orchestrator
 
         # --skip: force specific tasks to DONE
         if args.skip:
