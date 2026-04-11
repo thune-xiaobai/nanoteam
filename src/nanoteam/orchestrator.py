@@ -268,6 +268,8 @@ class Orchestrator:
 
             self.ws.save_task_graph(graph)
 
+    MAX_AUTO_RETRIES = 3  # Safety cap for auto-retries on stall with activity
+
     def _execute_task(self, graph: TaskGraph, task: Task) -> None:
         _log(f"Executing {task.id}: {task.title} (role={task.role}, model={task.assigned_model})")
         self.ws.append_log({"event": "task_start", "task_id": task.id, "role": task.role})
@@ -275,39 +277,54 @@ class Orchestrator:
         task.status = TaskStatus.IN_PROGRESS
         self.ws.save_task_graph(graph)
 
-        # Snapshot files before worker runs
-        before = self.ws.snapshot_files()
-
         role = graph.roles.get(task.role) if task.role else None
         spec = self.ws.read_task_spec(task.id)
-        context = self.ws.build_dynamic_context(task, graph)
         role_def = role.description if role else "General-purpose software engineer."
 
-        sys_prompt, user_prompt = worker_prompt(spec, context, role_def)
+        # Auto-retry loop: keep retrying while worker had activity (transient failure)
+        # Stop when: success, no activity (task problem), or safety cap reached
+        auto_retries = 0
+        while True:
+            before = self.ws.snapshot_files()
+            context = self.ws.build_dynamic_context(task, graph)
+            sys_prompt, user_prompt = worker_prompt(spec, context, role_def)
 
-        worker_result = self._invoke_and_record(
-            graph, task.id, "execute", sys_prompt, user_prompt,
-            model=task.assigned_model,
-            effort=self.config.worker_effort,
-            allowed_tools=role.allowed_tools if role else None,
-            add_dirs=self._resolve_dirs(role) if role else None,
-            max_budget_usd=self.config.worker_budget,
-            cwd=str(self.ws.root),
-        )
+            worker_result = self._invoke_and_record(
+                graph, task.id, "execute", sys_prompt, user_prompt,
+                model=task.assigned_model,
+                effort=self.config.worker_effort,
+                allowed_tools=role.allowed_tools if role else None,
+                add_dirs=self._resolve_dirs(role) if role else None,
+                max_budget_usd=self.config.worker_budget,
+                cwd=str(self.ws.root),
+            )
 
-        # Save session_id for potential resume
-        if worker_result.session_id:
-            task.session_id = worker_result.session_id
-            self.ws.save_task_graph(graph)
+            # Save session_id for potential resume
+            if worker_result.session_id:
+                task.session_id = worker_result.session_id
+                self.ws.save_task_graph(graph)
 
-        # Snapshot after and record changed files
-        after = self.ws.snapshot_files()
-        task.changed_files = self.ws.diff_files(before, after)
-        if task.changed_files:
-            _log(f"  Files changed: {', '.join(task.changed_files)}")
+            # Snapshot after and record changed files
+            after = self.ws.snapshot_files()
+            task.changed_files = self.ws.diff_files(before, after)
+            if task.changed_files:
+                _log(f"  Files changed: {', '.join(task.changed_files)}")
+
+            if worker_result.success:
+                break
+
+            # Worker failed — decide whether to auto-retry
+            if worker_result.had_activity and auto_retries < self.MAX_AUTO_RETRIES:
+                auto_retries += 1
+                _log(f"Worker had activity but failed ({worker_result.error}), auto-retrying ({auto_retries}/{self.MAX_AUTO_RETRIES})...")
+                self.ws.append_log({"event": "auto_retry", "task_id": task.id, "attempt": auto_retries, "error": (worker_result.error or "")[:200]})
+                continue
+
+            # No activity or retries exhausted — fall through to review/replan
+            _log(f"Worker failed on {task.id}: {worker_result.error}")
+            break
 
         if not worker_result.success:
-            _log(f"Worker failed on {task.id}: {worker_result.error}")
             self.ws.write_task_result(task.id, f"FAILED: {worker_result.error}")
         else:
             self.ws.write_task_result(task.id, worker_result.output)
