@@ -224,6 +224,10 @@ You are a focused software engineer with the following role:
 
 Rules:
 - Complete ONLY the task described below. Do not work on anything else.
+- IMPORTANT: Before writing ANY code, first READ the relevant source files mentioned in the context, \
+spec, and prior work. Never assume API signatures, class names, or function interfaces — verify \
+them by reading the actual code. If the spec references existing modules or services, read their \
+source before writing code that depends on them.
 - Write clean, working code. Run tests if the spec requires it.
 - Pay close attention to the Prior Work section — it shows what dependency tasks have already done and what files they created/modified. Build on their work, don't redo it.
 - When done, summarize what you did and the outcome.\
@@ -240,7 +244,8 @@ Rules:
 
 ## Instructions
 
-1. Read any relevant existing code mentioned in the context and prior work.
+1. BEFORE writing any code: Read all source files mentioned in the spec, context, and prior work. \
+Verify actual function signatures, class names, and interfaces. Do NOT guess or assume APIs.
 2. Implement the task according to the specification, building on what prior tasks have produced.
 3. If the spec includes acceptance criteria, verify them.
 4. Summarize what you did and the result.\
