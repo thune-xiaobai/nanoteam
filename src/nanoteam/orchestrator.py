@@ -5,7 +5,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from .claude import ClaudeResult, invoke_claude
+from .claude import ClaudeResult, invoke_claude, resume_claude
 from .models import Role, Task, TaskGraph, TaskStatus
 from .prompts import (
     lead_checkpoint_chat_prompt,
@@ -132,6 +132,22 @@ class Orchestrator:
             raise RuntimeError(f"Planning failed: {result.error}")
 
         plan = self._parse_json(result.output)
+
+        if not plan.get("tasks") and result.session_id:
+            _log("Lead returned no tasks — retrying in same session...")
+            retry_prompt = (
+                "Your previous response did not contain a valid JSON plan. "
+                "Please output ONLY the JSON object matching the schema, with no extra text."
+            )
+            retry = resume_claude(
+                result.session_id, retry_prompt,
+                model=self.config.lead_model,
+                cwd=str(self.ws.root),
+            )
+            self.total_cost += retry.cost_usd
+            graph.total_cost = self.total_cost
+            if retry.success:
+                plan = self._parse_json(retry.output)
 
         if not plan.get("tasks"):
             _log(f"Lead returned no tasks. Raw output: {(result.output or '')[:200]}")
@@ -368,17 +384,28 @@ class Orchestrator:
 
     def _parse_json(self, text: str) -> dict:
         text = text.strip()
+        # Strip markdown fences
         if text.startswith("```"):
             lines = text.split("\n")
             lines = lines[1:]
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             text = "\n".join(lines)
+        # Try direct parse first
         try:
             return json.loads(text)
-        except json.JSONDecodeError as e:
-            _log(f"JSON parse error: {e}. Raw text: {text[:200]}")
-            return {"verdict": "accept", "reason": "JSON parse failed, auto-accepting.", "action": "retry"}
+        except json.JSONDecodeError:
+            pass
+        # Extract JSON from mixed text: find first { and last }
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end > start:
+            try:
+                return json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+        _log(f"JSON parse error. Raw text: {text[:200]}")
+        return {"verdict": "accept", "reason": "JSON parse failed, auto-accepting.", "action": "retry"}
 
     def _finalize(self, graph: TaskGraph) -> None:
         _log("=" * 50)

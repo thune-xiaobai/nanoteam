@@ -18,6 +18,7 @@ class ClaudeResult:
     cost_usd: float
     duration_s: float = 0
     error: str | None = None
+    session_id: str | None = None
 
 
 def invoke_claude(
@@ -150,6 +151,7 @@ def invoke_claude(
         is_error = result_data.get("is_error", False)
         cost = result_data.get("total_cost_usd", 0) or 0
         num_turns = result_data.get("num_turns", 0)
+        session_id = result_data.get("session_id")
         _log(f"  done in {duration:.0f}s | cost=${cost:.4f} | turns={num_turns}")
 
         # If error with empty result, try to get more info from stderr or the event itself
@@ -167,6 +169,7 @@ def invoke_claude(
             cost_usd=cost,
             duration_s=duration,
             error=error_msg,
+            session_id=session_id,
         )
 
     # Fallback: no result event found
@@ -229,3 +232,133 @@ def _summarize_tool_use(name: str, inp: dict) -> str:
 
 def _log(msg: str) -> None:
     print(f"[nanoteam] {msg}", file=sys.stderr, flush=True)
+
+
+def resume_claude(
+    session_id: str,
+    prompt: str,
+    *,
+    model: str = "claude-opus-4-6",
+    cwd: str | None = None,
+    timeout: int = DEFAULT_TIMEOUT,
+    stall_timeout: int = DEFAULT_STALL_TIMEOUT,
+) -> ClaudeResult:
+    """Resume an existing Claude session with a follow-up prompt."""
+    cmd = [
+        "claude",
+        "-p", prompt,
+        "--output-format", "stream-json",
+        "--verbose",
+        "--resume", session_id,
+        "--model", model,
+        "--permission-mode", "bypassPermissions",
+    ]
+
+    _log(f"Resuming session {session_id[:8]}...: {prompt[:80]}...")
+
+    start = time.monotonic()
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+        cwd=cwd,
+    )
+
+    result_data: dict | None = None
+    last_activity = time.monotonic()
+    buf = b""
+
+    try:
+        assert proc.stdout is not None
+        fd = proc.stdout.fileno()
+
+        while True:
+            ready, _, _ = select.select([fd], [], [], 5.0)
+
+            now = time.monotonic()
+            elapsed = now - start
+            idle = now - last_activity
+
+            if elapsed >= timeout:
+                proc.kill()
+                proc.wait()
+                return ClaudeResult(
+                    success=False, output="", cost_usd=0,
+                    duration_s=elapsed,
+                    error=f"Timeout after {elapsed:.0f}s",
+                    session_id=session_id,
+                )
+
+            if idle >= stall_timeout:
+                proc.kill()
+                proc.wait()
+                return ClaudeResult(
+                    success=False, output="", cost_usd=0,
+                    duration_s=elapsed,
+                    error=f"Stalled: no output for {idle:.0f}s",
+                    session_id=session_id,
+                )
+
+            if not ready:
+                continue
+
+            chunk = proc.stdout.read1(8192) if hasattr(proc.stdout, 'read1') else proc.stdout.read(8192)
+            if not chunk:
+                break
+
+            last_activity = time.monotonic()
+            buf += chunk
+
+            while b"\n" in buf:
+                line_bytes, buf = buf.split(b"\n", 1)
+                line = line_bytes.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                etype = event.get("type", "")
+                if etype == "assistant":
+                    _process_assistant_event(event)
+                elif etype == "result":
+                    result_data = event
+
+        proc.wait()
+
+    except KeyboardInterrupt:
+        proc.kill()
+        proc.wait()
+        raise
+
+    duration = time.monotonic() - start
+
+    if result_data:
+        result_text = result_data.get("result", "")
+        is_error = result_data.get("is_error", False)
+        cost = result_data.get("total_cost_usd", 0) or 0
+        num_turns = result_data.get("num_turns", 0)
+        _log(f"  done in {duration:.0f}s | cost=${cost:.4f} | turns={num_turns}")
+
+        error_msg = None
+        if is_error:
+            error_msg = result_text or "Unknown error"
+
+        return ClaudeResult(
+            success=not is_error,
+            output=result_text,
+            cost_usd=cost,
+            duration_s=duration,
+            error=error_msg,
+            session_id=session_id,
+        )
+
+    stderr = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
+    return ClaudeResult(
+        success=False, output="", cost_usd=0,
+        duration_s=duration,
+        error=stderr or f"No result event, exit code {proc.returncode}",
+        session_id=session_id,
+    )
