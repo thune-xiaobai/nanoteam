@@ -398,8 +398,11 @@ class Orchestrator:
         while True:
             try:
                 user_input = input("> ").strip()
-            except (EOFError, KeyboardInterrupt):
+            except EOFError:
                 break
+            except KeyboardInterrupt:
+                print(file=sys.stderr)
+                raise
 
             if not user_input:
                 break
