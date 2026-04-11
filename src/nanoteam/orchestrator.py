@@ -586,7 +586,8 @@ class Orchestrator:
             print(file=sys.stderr)
             _log("Key decisions:")
             for d in graph.decisions[-5:]:
-                _log(f"  - {d[:100]}")
+                text = d.get("text", str(d)) if isinstance(d, dict) else d
+                _log(f"  - {text[:100]}")
 
     def _print_plan_details(self, graph: TaskGraph) -> None:
         """Show spec preview for each pending task so user can review the plan."""
