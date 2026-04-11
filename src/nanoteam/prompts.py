@@ -29,6 +29,14 @@ Analyze this objective and produce a development plan. If this is a greenfield p
 3. Specify task dependencies (which tasks must finish before others can start).
 4. Record key architectural decisions.
 
+## Task Granularity Guidelines
+
+- Each task should be completable in a single focused session (target: 1-3 files created/modified).
+- If a task involves both adapting existing code AND building new features on top, split them into separate tasks.
+- If a task touches more than one independent subsystem (e.g., backend client + frontend UI + config), split by subsystem.
+- Prefer more smaller tasks over fewer large ones — 5-10 well-scoped tasks are better than 3 monolithic ones.
+- Each task spec must list the key files the worker needs to READ before implementing (existing code, reference implementations, API definitions).
+
 ## Output Schema
 
 ```json
