@@ -133,6 +133,10 @@ class Orchestrator:
 
         plan = self._parse_json(result.output)
 
+        if not plan.get("tasks"):
+            _log(f"Lead returned no tasks. Raw output: {(result.output or '')[:200]}")
+            raise RuntimeError("Planning produced no tasks")
+
         for tdata in plan.get("tasks", []):
             task = Task(
                 id=tdata["id"],
@@ -152,7 +156,7 @@ class Orchestrator:
         for rdata in plan.get("roles", []):
             role = Role(
                 name=rdata["name"],
-                description=rdata["description"],
+                description=rdata.get("description", rdata["name"]),
                 allowed_tools=rdata.get("allowed_tools", ["Read", "Grep", "Glob", "Edit", "Write", "Bash"]),
                 allowed_dirs=rdata.get("allowed_dirs", []),
             )
@@ -563,7 +567,7 @@ class Orchestrator:
         for rdata in changes.get("add_roles", []):
             role = Role(
                 name=rdata["name"],
-                description=rdata["description"],
+                description=rdata.get("description", rdata["name"]),
                 allowed_tools=rdata.get("allowed_tools", ["Read", "Grep", "Glob", "Edit", "Write", "Bash"]),
                 allowed_dirs=rdata.get("allowed_dirs", []),
             )
