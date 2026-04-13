@@ -53,13 +53,20 @@ class TaskGraph:
             if task.status == TaskStatus.READY:
                 ready.append(task)
             elif task.status == TaskStatus.PENDING:
-                if all(self.tasks[dep].status == TaskStatus.DONE for dep in task.depends_on):
+                deps = [self.tasks[dep] for dep in task.depends_on]
+                if any(d.status == TaskStatus.FAILED for d in deps):
+                    # Dependency permanently failed — cascade failure
+                    task.status = TaskStatus.FAILED
+                elif all(d.status == TaskStatus.DONE for d in deps):
                     task.status = TaskStatus.READY
                     ready.append(task)
         return ready
 
     def is_complete(self) -> bool:
-        return all(t.status == TaskStatus.DONE for t in self.tasks.values())
+        return all(
+            t.status in (TaskStatus.DONE, TaskStatus.FAILED)
+            for t in self.tasks.values()
+        )
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
