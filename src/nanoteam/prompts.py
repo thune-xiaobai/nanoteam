@@ -274,6 +274,31 @@ Verify actual function signatures, class names, and interfaces. Do NOT guess or 
     return system, user
 
 
+def worker_resume_prompt(spec: str, context: str) -> str:
+    """Prompt for a resumed worker session — role/codebase knowledge carried over."""
+    return f"""\
+## New Task
+
+You have a new task to complete. Your role and codebase knowledge carry over from your previous work.
+
+## Task Specification
+
+{spec}
+
+## Context
+
+{context}
+
+## Instructions
+
+1. BEFORE writing any code: Read any NEW source files mentioned in the spec and context that you \
+haven't seen before. Verify actual function signatures and interfaces.
+2. Implement the task according to the specification, building on what prior tasks have produced.
+3. If the spec includes acceptance criteria, verify them.
+4. Summarize what you did and the result.\
+"""
+
+
 # -- Lead: Checkpoint Chat (answer questions or modify plan) --
 
 def lead_checkpoint_chat_prompt(

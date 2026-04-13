@@ -14,6 +14,7 @@ from .prompts import (
     lead_replan_prompt,
     lead_review_prompt,
     worker_prompt,
+    worker_resume_prompt,
 )
 from .workspace import Workspace
 
@@ -71,6 +72,7 @@ class Orchestrator:
         self.config = config
         self.total_cost = 0.0
         self._turn_counter = 0
+        self._role_sessions: dict[str, str] = {}  # role -> last successful session_id
 
     def run(self) -> None:
         graph = self.ws.load_task_graph()
@@ -287,17 +289,35 @@ class Orchestrator:
         while True:
             before = self.ws.snapshot_files()
             context = self.ws.build_dynamic_context(task, graph)
-            sys_prompt, user_prompt = worker_prompt(spec, context, role_def)
 
-            worker_result = self._invoke_and_record(
-                graph, task.id, "execute", sys_prompt, user_prompt,
-                model=task.assigned_model,
-                effort=self.config.worker_effort,
-                allowed_tools=role.allowed_tools if role else None,
-                add_dirs=self._resolve_dirs(role) if role else None,
-                max_budget_usd=self.config.worker_budget,
-                cwd=str(self.ws.root),
-            )
+            # Try resuming a previous session for this role (avoids re-reading codebase)
+            prev_session = self._role_sessions.get(task.role) if task.role else None
+            worker_result = None
+
+            if prev_session:
+                _log(f"  Resuming session from previous {task.role} task...")
+                prompt = worker_resume_prompt(spec, context)
+                worker_result = self._resume_and_record(
+                    graph, task.id, "execute", prompt, prev_session,
+                    model=task.assigned_model,
+                    cwd=str(self.ws.root),
+                )
+                if not worker_result.success:
+                    _log(f"  Resume failed, falling back to fresh session")
+                    self._role_sessions.pop(task.role, None)
+                    worker_result = None
+
+            if worker_result is None:
+                sys_prompt, user_prompt = worker_prompt(spec, context, role_def)
+                worker_result = self._invoke_and_record(
+                    graph, task.id, "execute", sys_prompt, user_prompt,
+                    model=task.assigned_model,
+                    effort=self.config.worker_effort,
+                    allowed_tools=role.allowed_tools if role else None,
+                    add_dirs=self._resolve_dirs(role) if role else None,
+                    max_budget_usd=self.config.worker_budget,
+                    cwd=str(self.ws.root),
+                )
 
             # Save session_id for potential resume
             if worker_result.session_id:
@@ -326,8 +346,12 @@ class Orchestrator:
 
         if not worker_result.success:
             self.ws.write_task_result(task.id, f"FAILED: {worker_result.error}")
+            if task.role:
+                self._role_sessions.pop(task.role, None)
         else:
             self.ws.write_task_result(task.id, worker_result.output)
+            if task.role and worker_result.session_id:
+                self._role_sessions[task.role] = worker_result.session_id
 
         task.status = TaskStatus.REVIEW
         verdict = self._review(graph, task)
@@ -488,6 +512,58 @@ class Orchestrator:
             "duration_s": result.duration_s,
             "prompt_file": prompt_path,
             "response_file": response_path,
+        })
+
+        return result
+
+    def _resume_and_record(
+        self,
+        graph: TaskGraph,
+        task_id: str | None,
+        phase: str,
+        prompt: str,
+        session_id: str,
+        **kwargs,
+    ) -> ClaudeResult:
+        """Resume a Claude session with turn recording and logging."""
+        self._turn_counter += 1
+        turn = self._turn_counter
+
+        self.ws.append_log({
+            "event": "invoke_claude",
+            "task_id": task_id,
+            "phase": phase,
+            "model": kwargs.get("model", "?"),
+            "turn": turn,
+            "resumed_session": session_id[:8],
+        })
+
+        result = resume_claude(
+            session_id,
+            prompt,
+            timeout=kwargs.pop("timeout", self.config.timeout),
+            stall_timeout=kwargs.pop("stall_timeout", self.config.stall_timeout),
+            **kwargs,
+        )
+        self.total_cost += result.cost_usd
+        graph.total_cost = self.total_cost
+        self.ws.save_task_graph(graph)
+
+        prompt_path, response_path = self.ws.write_turn(
+            task_id, turn, phase,
+            prompt, result.output or result.error or "",
+        )
+
+        self.ws.append_log({
+            "event": "invoke_result",
+            "task_id": task_id,
+            "phase": phase,
+            "success": result.success,
+            "cost": result.cost_usd,
+            "duration_s": result.duration_s,
+            "prompt_file": prompt_path,
+            "response_file": response_path,
+            "resumed": True,
         })
 
         return result
