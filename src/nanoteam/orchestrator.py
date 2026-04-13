@@ -93,7 +93,14 @@ class Orchestrator:
             self._resume_interrupted_tasks(graph)
 
         while not graph.is_complete():
-            self._check_budget()
+            if self.total_cost >= self.config.max_budget:
+                _log(f"Budget exhausted: ${self.total_cost:.2f} >= ${self.config.max_budget:.2f}")
+                prev_budget = self.config.max_budget
+                self._checkpoint(graph, "budget")
+                self.ws.save_task_graph(graph)
+                if self.config.max_budget <= prev_budget:
+                    break  # user didn't increase budget
+                continue
 
             ready = graph.ready_tasks()
             if not ready:
@@ -101,8 +108,19 @@ class Orchestrator:
                 if in_progress:
                     _log("Tasks still in progress, but none ready. Possible stall.")
                 else:
-                    _log("No tasks ready and none in progress. Deadlock detected.")
-                break
+                    _log("No tasks ready. Entering interactive recovery...")
+
+                # Snapshot state before checkpoint
+                prev_snapshot = {t.id: (t.status, t.attempt) for t in graph.tasks.values()}
+                prev_count = len(graph.tasks)
+                self._checkpoint(graph, "stuck")
+                self.ws.save_task_graph(graph)
+
+                # If user made changes (skip/retry/add/remove), continue the loop
+                new_snapshot = {t.id: (t.status, t.attempt) for t in graph.tasks.values()}
+                if new_snapshot != prev_snapshot or len(graph.tasks) != prev_count:
+                    continue
+                break  # user pressed Enter without changes — stop
 
             for task in ready:
                 self._execute_task(graph, task)
@@ -460,6 +478,7 @@ class Orchestrator:
         return [str(self.ws.root / d) for d in role.allowed_dirs]
 
     def _check_budget(self) -> None:
+        """Raise if over budget. Only used outside the main loop (e.g. planning)."""
         if self.total_cost >= self.config.max_budget:
             raise RuntimeError(
                 f"Budget exhausted: ${self.total_cost:.2f} >= ${self.config.max_budget:.2f}"
@@ -614,7 +633,20 @@ class Orchestrator:
             self._print_plan_details(graph)
 
         print(file=sys.stderr)
-        _log("Press Enter to continue, or type a question/feedback:")
+        if phase == "stuck":
+            failed = [t for t in graph.tasks.values() if t.status == TaskStatus.FAILED]
+            if failed:
+                _log("Quick commands:")
+                _log("  skip <task-id>   — mark a task as done (skip it)")
+                _log("  retry <task-id>  — reset a failed task for retry")
+                _log("  Or type a question/instruction for Lead")
+            _log("Press Enter to stop, or type a command:")
+        elif phase == "budget":
+            _log(f"Budget ${self.config.max_budget:.2f} exhausted (spent ${self.total_cost:.2f}).")
+            _log("  Type a number to set new budget (e.g. '200')")
+            _log("  Or press Enter to stop:")
+        else:
+            _log("Press Enter to continue, or type a question/feedback:")
 
         # Conversation loop: user can ask questions or give feedback multiple times
         while True:
@@ -682,11 +714,15 @@ class Orchestrator:
             _log(f"  {t.id} [{t.role or 'unassigned'}]: {preview}")
 
     def _handle_checkpoint_input(self, graph: TaskGraph, user_input: str) -> None:
-        """Send user input to Lead for intent classification and response."""
+        """Handle user input: quick commands first, then delegate to Lead."""
         graph.feedback_log.append(user_input)
         self.ws.append_log({"event": "checkpoint_chat", "input": user_input[:200]})
 
-        # Gather task specs for Lead context
+        # Quick commands — no Lead invocation needed
+        if self._handle_quick_command(graph, user_input):
+            return
+
+        # Delegate to Lead for complex requests
         task_specs = {}
         for tid in graph.tasks:
             task_specs[tid] = self.ws.read_task_spec(tid) or ""
@@ -717,6 +753,62 @@ class Orchestrator:
             # Apply plan modifications
             self._apply_plan_changes(graph, response)
 
+    def _handle_quick_command(self, graph: TaskGraph, user_input: str) -> bool:
+        """Handle direct commands without invoking Lead. Returns True if handled."""
+        parts = user_input.strip().split(None, 1)
+        cmd = parts[0].lower() if parts else ""
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if cmd == "skip" and arg:
+            if arg not in graph.tasks:
+                _log(f"Unknown task: {arg}")
+            elif graph.tasks[arg].status == TaskStatus.DONE:
+                _log(f"{arg} is already done")
+            else:
+                graph.tasks[arg].status = TaskStatus.DONE
+                self.ws.save_task_graph(graph)
+                _log(f"Skipped {arg}")
+            return True
+
+        if cmd == "retry" and arg:
+            if arg not in graph.tasks:
+                _log(f"Unknown task: {arg}")
+            elif graph.tasks[arg].status != TaskStatus.FAILED:
+                _log(f"{arg} is not failed (status: {graph.tasks[arg].status.value})")
+            else:
+                graph.tasks[arg].status = TaskStatus.PENDING
+                graph.tasks[arg].attempt = 0
+                self.ws.save_task_graph(graph)
+                _log(f"Reset {arg} for retry")
+            return True
+
+        if cmd == "budget" and arg:
+            try:
+                new_budget = float(arg)
+                if new_budget > self.total_cost:
+                    self.config.max_budget = new_budget
+                    _log(f"Budget increased to ${new_budget:.2f}")
+                else:
+                    _log(f"New budget must be > current cost ${self.total_cost:.2f}")
+            except ValueError:
+                _log(f"Invalid budget: {arg}")
+            return True
+
+        # Plain number → budget shorthand
+        if user_input.strip().replace(".", "", 1).isdigit():
+            try:
+                new_budget = float(user_input.strip())
+                if new_budget > self.total_cost:
+                    self.config.max_budget = new_budget
+                    _log(f"Budget increased to ${new_budget:.2f}")
+                else:
+                    _log(f"New budget must be > current cost ${self.total_cost:.2f}")
+            except ValueError:
+                return False
+            return True
+
+        return False
+
     def _apply_feedback(self, graph: TaskGraph, feedback: str) -> None:
         """Send client feedback to Lead and apply the resulting plan changes."""
         _log("Sending feedback to Lead...")
@@ -740,18 +832,38 @@ class Orchestrator:
 
     def _apply_plan_changes(self, graph: TaskGraph, changes: dict) -> None:
         """Apply plan modifications from Lead response."""
-        # Modify existing tasks
+        # Modify existing tasks (now also handles FAILED tasks)
         for mod in changes.get("modify_tasks", []):
             tid = mod.get("id")
             if tid and tid in graph.tasks:
                 task = graph.tasks[tid]
-                if task.status in (TaskStatus.PENDING, TaskStatus.READY):
+                if task.status in (TaskStatus.PENDING, TaskStatus.READY, TaskStatus.FAILED):
                     if mod.get("updated_spec"):
                         self.ws.write_task_spec(tid, mod["updated_spec"])
                         _log(f"  Updated spec for {tid}")
                     if mod.get("updated_title"):
                         task.title = mod["updated_title"]
                         _log(f"  Updated title for {tid}: {task.title}")
+                    # Reset failed tasks so they can be retried
+                    if task.status == TaskStatus.FAILED:
+                        task.status = TaskStatus.PENDING
+                        task.attempt = 0
+                        _log(f"  Reset {tid} for retry")
+
+        # Retry failed tasks (reset to PENDING)
+        for tid in changes.get("retry_tasks", []):
+            if tid in graph.tasks and graph.tasks[tid].status == TaskStatus.FAILED:
+                graph.tasks[tid].status = TaskStatus.PENDING
+                graph.tasks[tid].attempt = 0
+                _log(f"  Retrying task {tid}")
+
+        # Skip tasks (mark as DONE)
+        for tid in changes.get("skip_tasks", []):
+            if tid in graph.tasks and graph.tasks[tid].status in (
+                TaskStatus.FAILED, TaskStatus.PENDING, TaskStatus.READY,
+            ):
+                graph.tasks[tid].status = TaskStatus.DONE
+                _log(f"  Skipped task {tid}")
 
         # Add new tasks
         for tdata in changes.get("add_tasks", []):
