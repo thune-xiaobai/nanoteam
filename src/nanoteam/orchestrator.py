@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import select
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -651,7 +652,7 @@ class Orchestrator:
         # Conversation loop: user can ask questions or give feedback multiple times
         while True:
             try:
-                user_input = input("> ").strip()
+                user_input = _read_multiline("> ")
             except EOFError:
                 break
             except KeyboardInterrupt:
@@ -916,6 +917,37 @@ class Orchestrator:
 
 def _log(msg: str) -> None:
     print(f"[nanoteam] {msg}", file=sys.stderr)
+
+
+def _read_multiline(prompt: str = "> ") -> str:
+    """Read input, accumulating multi-line paste automatically.
+
+    Typed input works as before (single line, Enter submits).
+    Pasted multi-line text is detected via stdin buffering and
+    accumulated into one string.  When a multi-line paste is
+    detected, the user is shown a summary and can add context
+    before confirming.
+    """
+    first_line = input(prompt)
+    lines = [first_line]
+
+    # After the first line, drain any remaining lines in the buffer
+    # (indicates a multi-line paste rather than typed input)
+    while select.select([sys.stdin], [], [], 0.05)[0]:
+        line = sys.stdin.readline()
+        if not line:  # EOF
+            break
+        lines.append(line.rstrip("\n"))
+
+    text = "\n".join(lines).strip()
+
+    if len(lines) > 1:
+        _log(f"(Pasted {len(lines)} lines)")
+        extra = input("  Add context or Enter to send: ").strip()
+        if extra:
+            text = text + "\n\n" + extra
+
+    return text
 
 
 import re
