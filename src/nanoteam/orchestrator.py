@@ -114,14 +114,15 @@ class Orchestrator:
                 # Snapshot state before checkpoint
                 prev_snapshot = {t.id: (t.status, t.attempt) for t in graph.tasks.values()}
                 prev_count = len(graph.tasks)
-                self._checkpoint(graph, "stuck")
+                had_interaction = self._checkpoint(graph, "stuck")
                 self.ws.save_task_graph(graph)
 
                 # If user made changes (skip/retry/add/remove), continue the loop
                 new_snapshot = {t.id: (t.status, t.attempt) for t in graph.tasks.values()}
-                if new_snapshot != prev_snapshot or len(graph.tasks) != prev_count:
+                graph_changed = new_snapshot != prev_snapshot or len(graph.tasks) != prev_count
+                if graph_changed or had_interaction:
                     continue
-                break  # user pressed Enter without changes — stop
+                break  # user pressed Enter without any interaction — stop
 
             for task in ready:
                 self._execute_task(graph, task)
@@ -625,8 +626,11 @@ class Orchestrator:
 
     # -- Checkpoint (client interaction) --
 
-    def _checkpoint(self, graph: TaskGraph, phase: str) -> None:
-        """Pause for client review and conversational interaction."""
+    def _checkpoint(self, graph: TaskGraph, phase: str) -> bool:
+        """Pause for client review and conversational interaction.
+
+        Returns True if the user provided any input during the checkpoint.
+        """
         self._print_status(graph, phase)
 
         # Show task specs at plan checkpoint so user can see the full plan
@@ -649,6 +653,8 @@ class Orchestrator:
         else:
             _log("Press Enter to continue, or type a question/feedback:")
 
+        had_interaction = False
+
         # Conversation loop: user can ask questions or give feedback multiple times
         while True:
             try:
@@ -662,9 +668,12 @@ class Orchestrator:
             if not user_input:
                 break
 
+            had_interaction = True
             self._handle_checkpoint_input(graph, user_input)
             print(file=sys.stderr)
             _log("Press Enter to continue, or type another question/feedback:")
+
+        return had_interaction
 
     def _print_status(self, graph: TaskGraph, phase: str) -> None:
         done = [t for t in graph.tasks.values() if t.status == TaskStatus.DONE]
